@@ -167,3 +167,5 @@ pids
 *.pid.lock
 
 instructions/
+
+notebooks/data/
