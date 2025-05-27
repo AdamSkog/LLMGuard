@@ -169,3 +169,5 @@ pids
 instructions/
 
 notebooks/data/
+
+dpo_qwen3_security_finetuned/
