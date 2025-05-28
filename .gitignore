@@ -169,5 +169,6 @@ pids
 instructions/
 
 notebooks/data/
+notebooks/addtohfhub.ipynb
 
 dpo_qwen3_security_finetuned/
