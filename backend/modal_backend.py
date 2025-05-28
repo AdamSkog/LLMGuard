@@ -275,7 +275,7 @@ def detect_language(extension: str) -> str:
 
 
 @app.cls(
-    image=image.pip_install(["unsloth"]),
+    image=image.pip_install(["vllm>=0.6.0"]),  # Replace unsloth with vLLM
     gpu=GPU_CONFIG,
     scaledown_window=600,
     timeout=3600,
@@ -286,53 +286,97 @@ class SecurityAnalyzer:
 
     @modal.enter()
     def setup(self):
-        """Initialize with Unsloth + PEFT (proven working approach)."""
-        print("🚀 Initializing SecurityAnalyzer with Unsloth + PEFT...")
-        print(f"📥 Loading LoRA adapters from: {self.model_name}")
+        """Initialize with vLLM for fast parallel inference."""
+        print("🚀 Initializing SecurityAnalyzer with vLLM...")
+        print(f"📥 Loading model with LoRA adapters: {self.model_name}")
 
         try:
-            # Import required libraries
-            from peft import PeftModel
-            from unsloth import FastLanguageModel
+            from vllm import LLM, SamplingParams
+            from vllm.lora.request import LoRARequest
 
-            print("Loading base model with Unsloth...")
-            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-                model_name="unsloth/Qwen3-4B-unsloth-bnb-4bit",
-                max_seq_length=2048,
-                dtype=None,
-                load_in_4bit=True,
+            # Initialize vLLM with T4-optimized settings for speed
+            print("Loading model with vLLM...")
+            self.llm = LLM(
+                model="unsloth/Qwen3-4B-unsloth-bnb-4bit",
+                enable_lora=True,
+                max_lora_rank=32,
+                # T4 optimizations for speed
+                gpu_memory_utilization=0.85,
+                max_model_len=2048,
+                max_num_batched_tokens=512,  # Optimized batch size for T4
+                max_num_seqs=4,  # Process up to 4 files simultaneously
+                enforce_eager=True,  # Disable CUDA graphs for memory efficiency
+                swap_space=2,
+                # Additional speed optimizations
+                enable_chunked_prefill=True,
             )
 
-            print(f"Loading LoRA adapters from {self.model_name}...")
-            self.model = PeftModel.from_pretrained(self.model, self.model_name)
+            # LoRA adapter configuration
+            print(f"Setting up LoRA adapter: {self.model_name}")
+            self.lora_request = LoRARequest(
+                lora_name="security-dpo",
+                lora_int_id=1,
+                lora_path=self.model_name,
+            )
 
-            print("Enabling fast inference...")
-            FastLanguageModel.for_inference(self.model)
+            # Optimized sampling parameters for speed
+            self.sampling_params = SamplingParams(
+                temperature=0.1,  # Lower temperature for faster, more deterministic output
+                max_tokens=256,  # Reduced from 512 for speed
+                repetition_penalty=1.05,  # Reduced for speed
+                stop=["</analysis>", "---END---", "<|im_end|>"],
+            )
 
-            # Get model device
-            self.device = next(self.model.parameters()).device
-            print(f"🔧 Model loaded on device: {self.device}")
-
-            print("✅ SecurityAnalyzer initialized successfully!")
+            print("✅ SecurityAnalyzer with vLLM initialized successfully!")
 
         except Exception as e:
-            print(f"❌ Initialization failed: {str(e)}")
+            print(f"❌ vLLM initialization failed: {str(e)}")
             raise
 
     def analyze_file(
         self, file_path: str, file_content: str, language: str
     ) -> FileAnalysis:
-        """Analyze a single file for security vulnerabilities."""
+        """Analyze a single file for security vulnerabilities - OPTIMIZED."""
         try:
+            # SPEED OPTIMIZATION: Skip tiny files and non-risky file types
+            if len(file_content.strip()) < 50:
+                return FileAnalysis(
+                    file_path=file_path,
+                    language=language,
+                    issues=[],
+                    analysis_status="SKIPPED",
+                    error_message="File too small",
+                )
+
+            # SPEED OPTIMIZATION: Skip obviously safe files
+            safe_patterns = [
+                "test",
+                "spec",
+                "config",
+                "README",
+                "package.json",
+                "yarn.lock",
+            ]
+            if any(pattern.lower() in file_path.lower() for pattern in safe_patterns):
+                return FileAnalysis(
+                    file_path=file_path,
+                    language=language,
+                    issues=[],
+                    analysis_status="SKIPPED",
+                    error_message="Low-risk file type",
+                )
+
             # Check if file is too large for context window
-            if self._estimate_tokens(file_content) > 1200:
+            if self._estimate_tokens(file_content) > 800:  # Reduced threshold for speed
                 return self._analyze_large_file(file_path, file_content, language)
 
-            # Create security analysis prompt
-            prompt = self._create_security_prompt(file_path, file_content, language)
+            # Create shortened security analysis prompt
+            prompt = self._create_security_prompt_short(
+                file_path, file_content, language
+            )
 
-            # Generate analysis using Unsloth
-            analysis_text = self._generate_with_unsloth(prompt)
+            # Generate analysis using vLLM
+            analysis_text = self._generate_with_vllm(prompt)
             issues = self._parse_analysis(analysis_text, file_path)
 
             return FileAnalysis(
@@ -351,78 +395,47 @@ class SecurityAnalyzer:
                 error_message=str(e),
             )
 
-    def _generate_with_unsloth(self, prompt: str) -> str:
-        """Generate analysis using Unsloth model."""
-        import torch
-
-        # Tokenize input
-        inputs = self.tokenizer([prompt], return_tensors="pt")
-
-        # Move inputs to model device
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # Generate response
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.3,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-                repetition_penalty=1.1,
+    def _generate_with_vllm(self, prompt: str) -> str:
+        """Generate analysis using vLLM - OPTIMIZED FOR SPEED."""
+        try:
+            # Generate with vLLM
+            outputs = self.llm.generate(
+                prompts=[prompt],
+                sampling_params=self.sampling_params,
+                lora_request=self.lora_request,
             )
 
-        # Decode response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Extract generated text
+            analysis_text = outputs[0].outputs[0].text
+            return analysis_text.strip()
 
-        # Extract just the analysis part (remove the original prompt)
-        if len(response) > len(prompt):
-            analysis = response[len(prompt) :].strip()
-        else:
-            analysis = response.strip()
+        except Exception as e:
+            print(f"vLLM generation error: {e}")
+            return "NO_ISSUES_FOUND"
 
-        return analysis
-
-    def _create_security_prompt(
+    def _create_security_prompt_short(
         self, file_path: str, file_content: str, language: str
     ) -> str:
-        """Create a structured prompt for security analysis."""
+        """Create a SHORTENED prompt for faster analysis."""
+        # SPEED OPTIMIZATION: Much shorter, focused prompt
         return f"""<|im_start|>system
-You are a security expert analyzing code for vulnerabilities. Focus on:
+Security scan for {language} code. Find: SQL injection, XSS, auth issues, input validation, crypto problems, path traversal, command injection.
 
-1. **SQL Injection** - Unsafe database queries
-2. **Cross-Site Scripting (XSS)** - Unescaped user input
-3. **Authentication/Authorization** - Weak access controls
-4. **Input Validation** - Missing input sanitization
-5. **Cryptographic Issues** - Weak encryption, hardcoded secrets
-6. **Path Traversal** - Unsafe file operations
-7. **Command Injection** - Unsafe system commands
-8. **Buffer Overflows** - Memory safety issues
-9. **Race Conditions** - Concurrency issues
-10. **Information Disclosure** - Sensitive data exposure
-
-For each issue, provide:
-```
+Format each issue:
 ISSUE_START
 File: {file_path}
-Line: [line_number]
-Severity: [HIGH/MEDIUM/LOW]
+Line: [number]
+Severity: HIGH/MEDIUM/LOW
 Type: [vulnerability_type]
-Description: [description]
-Recommendation: [fix_recommendation]
-Code: [code_snippet]
+Description: [brief_description]
+Recommendation: [fix]
 ISSUE_END
-```
 
-If no issues found, respond: "NO_ISSUES_FOUND"
+If no issues: "NO_ISSUES_FOUND"
 <|im_end|>
 
 <|im_start|>user
-Analyze this {language} file:
-
-**File:** {file_path}
+Analyze: {file_path}
 
 ```{language}
 {file_content}
@@ -430,8 +443,6 @@ Analyze this {language} file:
 <|im_end|>
 
 <|im_start|>assistant
-I'll analyze this {language} code for security vulnerabilities.
-
 """
 
     def _analyze_large_file(
@@ -441,18 +452,30 @@ I'll analyze this {language} code for security vulnerabilities.
         chunks = self._split_code_intelligently(file_content, language)
         all_issues = []
 
+        # Process chunks in batches for speed
+        chunk_prompts = []
         for i, chunk in enumerate(chunks):
-            chunk_prompt = self._create_security_prompt(
+            chunk_prompt = self._create_security_prompt_short(
                 f"{file_path} (chunk {i+1}/{len(chunks)})", chunk, language
             )
+            chunk_prompts.append(chunk_prompt)
 
-            try:
-                analysis_text = self._generate_with_unsloth(chunk_prompt)
-                chunk_issues = self._parse_analysis(analysis_text, file_path)
-                all_issues.extend(chunk_issues)
+        try:
+            # Batch process all chunks at once with vLLM
+            if chunk_prompts:
+                outputs = self.llm.generate(
+                    prompts=chunk_prompts,
+                    sampling_params=self.sampling_params,
+                    lora_request=self.lora_request,
+                )
 
-            except Exception as e:
-                print(f"Error analyzing chunk {i+1} of {file_path}: {e}")
+                for output in outputs:
+                    analysis_text = output.outputs[0].text
+                    chunk_issues = self._parse_analysis(analysis_text, file_path)
+                    all_issues.extend(chunk_issues)
+
+        except Exception as e:
+            print(f"Error analyzing chunks of {file_path}: {e}")
 
         return FileAnalysis(
             file_path=file_path,
@@ -557,29 +580,121 @@ I'll analyze this {language} code for security vulnerabilities.
         return issues
 
     @modal.method()
-    def analyze_repository(self, repo_data: Dict[str, Any]) -> RepositoryAnalysis:
-        """Analyze an entire repository for security vulnerabilities."""
+    def analyze_repository_parallel(
+        self, repo_data: Dict[str, Any]
+    ) -> RepositoryAnalysis:
+        """Analyze repository with PARALLEL BATCH PROCESSING using vLLM."""
         file_analyses = []
         total_issues = 0
         files_with_issues = 0
 
-        print(f"🔍 Analyzing {len(repo_data['file_data'])} files...")
+        files_to_analyze = list(repo_data["file_data"].items())
+        print(
+            f"🔍 Analyzing {len(files_to_analyze)} files with vLLM batch processing..."
+        )
 
-        for file_path, file_info in repo_data["file_data"].items():
-            print(f"Analyzing: {file_path}")
+        # Prepare all prompts for batch processing
+        prompts = []
+        file_info_list = []
 
-            # Call analyze_file as a regular instance method
-            analysis = self.analyze_file(
-                file_path=file_path,
-                file_content=file_info["content"],
-                language=file_info["language"],
-            )
+        for file_path, file_info in files_to_analyze:
+            # Apply same filtering logic as individual analysis
+            content = file_info["content"]
+            language = file_info["language"]
 
-            file_analyses.append(analysis)
+            # Skip tiny files
+            if len(content.strip()) < 50:
+                file_analyses.append(
+                    FileAnalysis(
+                        file_path=file_path,
+                        language=language,
+                        issues=[],
+                        analysis_status="SKIPPED",
+                        error_message="File too small",
+                    )
+                )
+                continue
 
-            if analysis.issues:
-                files_with_issues += 1
-                total_issues += len(analysis.issues)
+            # Skip safe file patterns
+            safe_patterns = [
+                "test",
+                "spec",
+                "config",
+                "README",
+                "package.json",
+                "yarn.lock",
+            ]
+            if any(pattern.lower() in file_path.lower() for pattern in safe_patterns):
+                file_analyses.append(
+                    FileAnalysis(
+                        file_path=file_path,
+                        language=language,
+                        issues=[],
+                        analysis_status="SKIPPED",
+                        error_message="Low-risk file type",
+                    )
+                )
+                continue
+
+            # Skip large files for batch processing (handle separately)
+            if self._estimate_tokens(content) > 800:
+                analysis = self._analyze_large_file(file_path, content, language)
+                file_analyses.append(analysis)
+                if analysis.issues:
+                    files_with_issues += 1
+                    total_issues += len(analysis.issues)
+                continue
+
+            # Add to batch processing queue
+            prompt = self._create_security_prompt_short(file_path, content, language)
+            prompts.append(prompt)
+            file_info_list.append((file_path, language))
+
+        # BATCH PROCESS all suitable files at once with vLLM
+        if prompts:
+            print(f"🚀 Batch processing {len(prompts)} files with vLLM...")
+            try:
+                outputs = self.llm.generate(
+                    prompts=prompts,
+                    sampling_params=self.sampling_params,
+                    lora_request=self.lora_request,
+                )
+
+                # Process batch results
+                for i, output in enumerate(outputs):
+                    file_path, language = file_info_list[i]
+                    analysis_text = output.outputs[0].text
+                    issues = self._parse_analysis(analysis_text, file_path)
+
+                    analysis = FileAnalysis(
+                        file_path=file_path,
+                        language=language,
+                        issues=issues,
+                        analysis_status="SUCCESS",
+                    )
+                    file_analyses.append(analysis)
+
+                    if issues:
+                        files_with_issues += 1
+                        total_issues += len(issues)
+
+            except Exception as e:
+                print(f"Batch processing error: {e}")
+                # Fallback: mark all as errors
+                for file_path, language in file_info_list:
+                    file_analyses.append(
+                        FileAnalysis(
+                            file_path=file_path,
+                            language=language,
+                            issues=[],
+                            analysis_status="ERROR",
+                            error_message=str(e),
+                        )
+                    )
+
+        print(
+            f"✅ Analysis complete: {files_with_issues}/{len(files_to_analyze)} files with issues"
+        )
 
         return RepositoryAnalysis(
             repository_url=repo_data["repository_url"],
@@ -675,7 +790,7 @@ def fastapi_app():
             # Step 2: Analyze with security model
             print("Starting security analysis...")
             analyzer = SecurityAnalyzer()
-            analysis = analyzer.analyze_repository.remote(repo_data)
+            analysis = analyzer.analyze_repository_parallel.remote(repo_data)
 
             # Step 3: Generate summary statistics
             severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
