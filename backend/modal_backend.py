@@ -13,24 +13,45 @@ load_dotenv()
 # Modal app configuration
 app = modal.App("llmguard-security-analyzer")
 
-# GPU configuration - Fixed: Use string instead of modal.gpu.T4()
+# GPU configuration - Either T4 or A10G
 GPU_CONFIG = "T4"
 
-# Container image with all dependencies
-image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    [
-        "vllm>=0.6.0",
-        "torch>=2.0.0",
-        "transformers>=4.40.0",
-        "fastapi>=0.100.0",
-        "pydantic>=2.0.0",
-        "requests>=2.31.0",
-        "PyGithub>=1.59.0",
-        "tiktoken>=0.5.0",
-        "bitsandbytes>=0.45.3",  # Required for quantized models
-        "accelerate>=0.20.0",  # Required for model loading
-    ]
+# Model caching with Modal Volume
+model_volume = modal.Volume.from_name(
+    "qwen3-security-model-cache", create_if_missing=True
 )
+MODEL_CACHE_PATH = "/models"
+
+# Container image with all dependencies
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        [
+            "vllm>=0.6.0",
+            "torch>=2.0.0",
+            "transformers>=4.40.0",
+            "fastapi>=0.100.0",
+            "pydantic>=2.0.0",
+            "requests>=2.31.0",
+            "PyGithub>=1.59.0",
+            "tiktoken>=0.5.0",
+            "bitsandbytes>=0.45.3",  # Required for quantized models
+            "accelerate>=0.20.0",  # Required for model loading
+            "huggingface_hub>=0.19.0",  # For model downloading
+            "hf_transfer>=0.1.0",  # For fast HuggingFace downloads
+            "python-dotenv>=1.0.0",  # For environment variable loading
+        ]
+    )
+    .env(
+        {
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",  # Faster downloads from HF
+            "HF_HUB_CACHE": MODEL_CACHE_PATH,  # Point HF cache to our volume
+        }
+    )
+)
+
+# Your merged model configuration
+MERGED_MODEL_NAME = "AdamDS/qwen3-security-merged-4b"
 
 
 @dataclass
@@ -61,6 +82,85 @@ class RepositoryAnalysis:
     total_issues: int
     file_analyses: List[FileAnalysis]
     repository_structure: Dict[str, Any]
+
+
+@app.function(
+    image=image,
+    volumes={MODEL_CACHE_PATH: model_volume},
+    secrets=[modal.Secret.from_name("github-token")],
+    timeout=1800,  # 30 minutes for initial download
+)
+def download_model_to_volume():
+    """
+    Download the merged security model to Modal Volume for caching.
+    This only needs to run once to populate the cache.
+    """
+    import os
+    from pathlib import Path
+
+    from huggingface_hub import snapshot_download
+
+    print(f"🚀 Downloading merged model {MERGED_MODEL_NAME} to volume cache...")
+    print(f"📁 Cache directory: {MODEL_CACHE_PATH}")
+
+    # Check if model is already cached
+    model_path = Path(MODEL_CACHE_PATH) / MERGED_MODEL_NAME.replace("/", "--")
+
+    if model_path.exists() and any(model_path.iterdir()):
+        print("✅ Model already cached in volume!")
+        return {"status": "already_cached", "model_path": str(model_path)}
+
+    try:
+        # Download model to volume
+        local_model_path = snapshot_download(
+            repo_id=MERGED_MODEL_NAME,
+            local_dir=str(model_path),
+            ignore_patterns=["*.pt", "*.bin"],  # Use safetensors for efficiency
+            resume_download=True,
+        )
+
+        # Commit changes to volume
+        model_volume.commit()
+
+        print(f"✅ Model downloaded successfully to {local_model_path}")
+        print(f"📊 Volume committed - model ready for fast loading!")
+
+        return {
+            "status": "downloaded",
+            "model_path": local_model_path,
+            "cached_size": sum(
+                f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+            ),
+        }
+
+    except Exception as e:
+        print(f"❌ Error downloading model: {e}")
+        raise
+
+
+@app.function(
+    image=image,
+    volumes={MODEL_CACHE_PATH: model_volume},
+    timeout=300,
+)
+def check_model_cache():
+    """Check if model is cached and return cache status."""
+    from pathlib import Path
+
+    model_path = Path(MODEL_CACHE_PATH) / MERGED_MODEL_NAME.replace("/", "--")
+
+    if model_path.exists() and any(model_path.iterdir()):
+        file_count = len(list(model_path.rglob("*")))
+        total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+
+        return {
+            "cached": True,
+            "model_path": str(model_path),
+            "file_count": file_count,
+            "total_size_mb": total_size / (1024 * 1024),
+        }
+    else:
+        return {"cached": False, "model_path": str(model_path)}
 
 
 @app.function(
@@ -275,63 +375,92 @@ def detect_language(extension: str) -> str:
 
 
 @app.cls(
-    image=image.pip_install(["vllm>=0.6.0"]),  # Replace unsloth with vLLM
+    image=image,
+    volumes={MODEL_CACHE_PATH: model_volume},  # Mount the model cache volume
     gpu=GPU_CONFIG,
     scaledown_window=600,
     timeout=3600,
 )
 class SecurityAnalyzer:
     # Use Modal parameters instead of __init__
-    model_name: str = modal.parameter(default="AdamDS/qwen3-security-dpo-4b")
+    model_name: str = modal.parameter(default=MERGED_MODEL_NAME)
 
     @modal.enter()
     def setup(self):
-        """Initialize with vLLM for fast parallel inference."""
-        print("🚀 Initializing SecurityAnalyzer with vLLM...")
-        print(f"📥 Loading model with LoRA adapters: {self.model_name}")
+        """Initialize with vLLM using cached merged model."""
+        from pathlib import Path
+
+        print("🚀 Initializing SecurityAnalyzer with cached merged model...")
+        print(f"📥 Loading model: {self.model_name}")
+        print(f"📁 Model cache path: {MODEL_CACHE_PATH}")
+
+        # Check if model is cached locally
+        model_path = Path(MODEL_CACHE_PATH) / self.model_name.replace("/", "--")
+
+        if not model_path.exists() or not any(model_path.iterdir()):
+            print(
+                "❌ Model not found in cache! Please run download_model_to_volume() first."
+            )
+            raise RuntimeError(
+                f"Model {self.model_name} not cached. Run download_model_to_volume() first."
+            )
+
+        print(f"✅ Found cached model at: {model_path}")
 
         try:
             from vllm import LLM, SamplingParams
-            from vllm.lora.request import LoRARequest
 
-            # Initialize vLLM with T4-optimized settings for speed
-            print("Loading model with vLLM...")
+            # Load the merged model directly from cache (no LoRA needed)
+            print("🔥 Loading merged model with vLLM...")
             self.llm = LLM(
-                model="unsloth/Qwen3-4B-unsloth-bnb-4bit",
-                enable_lora=True,
-                max_lora_rank=32,
-                # T4 optimizations for speed
+                model=str(model_path),  # Load from local cache path
+                # Optimized settings for merged model on T4/A10G
                 gpu_memory_utilization=0.85,
                 max_model_len=2048,
-                max_num_batched_tokens=512,  # Optimized batch size for T4
-                max_num_seqs=4,  # Process up to 4 files simultaneously
-                enforce_eager=True,  # Disable CUDA graphs for memory efficiency
-                swap_space=2,
-                # Additional speed optimizations
-                enable_chunked_prefill=True,
+                max_num_batched_tokens=512,
+                max_num_seqs=4,
+                enforce_eager=True,
+                swap_space=4,
+                disable_log_stats=True,
+                trust_remote_code=True,  # May be needed for custom models
             )
 
-            # LoRA adapter configuration
-            print(f"Setting up LoRA adapter: {self.model_name}")
-            self.lora_request = LoRARequest(
-                lora_name="security-dpo",
-                lora_int_id=1,
-                lora_path=self.model_name,
-            )
+            # No LoRA needed since we're using the merged model
+            self.lora_request = None
 
-            # Optimized sampling parameters for speed
-            self.sampling_params = SamplingParams(
-                temperature=0.1,  # Lower temperature for faster, more deterministic output
-                max_tokens=256,  # Reduced from 512 for speed
-                repetition_penalty=1.05,  # Reduced for speed
-                stop=["</analysis>", "---END---", "<|im_end|>"],
-            )
-
-            print("✅ SecurityAnalyzer with vLLM initialized successfully!")
+            print("✅ Cached merged model loaded successfully!")
 
         except Exception as e:
-            print(f"❌ vLLM initialization failed: {str(e)}")
-            raise
+            print(f"❌ Error loading cached model: {str(e)}")
+            # Fallback: Try loading from HuggingFace directly
+            print("🔄 Falling back to HuggingFace direct loading...")
+            try:
+                self.llm = LLM(
+                    model=self.model_name,  # Load from HF
+                    gpu_memory_utilization=0.80,
+                    max_model_len=2048,
+                    max_num_batched_tokens=256,
+                    max_num_seqs=2,
+                    enforce_eager=True,
+                    swap_space=4,
+                    disable_log_stats=True,
+                )
+                self.lora_request = None
+                print("✅ Fallback model loading successful!")
+
+            except Exception as e2:
+                print(f"❌ All loading strategies failed: {str(e2)}")
+                raise RuntimeError(f"Failed to load model: {str(e2)}")
+
+        # Optimized sampling parameters for speed
+        self.sampling_params = SamplingParams(
+            temperature=0.1,
+            max_tokens=256,
+            repetition_penalty=1.05,
+            stop=["</analysis>", "---END---", "<|im_end|>"],
+        )
+
+        print("✅ SecurityAnalyzer initialization complete!")
 
     def analyze_file(
         self, file_path: str, file_content: str, language: str
@@ -367,7 +496,7 @@ class SecurityAnalyzer:
                 )
 
             # Check if file is too large for context window
-            if self._estimate_tokens(file_content) > 800:  # Reduced threshold for speed
+            if self._estimate_tokens(file_content) > 800:
                 return self._analyze_large_file(file_path, file_content, language)
 
             # Create shortened security analysis prompt
@@ -402,7 +531,7 @@ class SecurityAnalyzer:
             outputs = self.llm.generate(
                 prompts=[prompt],
                 sampling_params=self.sampling_params,
-                lora_request=self.lora_request,
+                lora_request=self.lora_request,  # None for merged model
             )
 
             # Extract generated text
@@ -419,7 +548,8 @@ class SecurityAnalyzer:
         """Create a SHORTENED prompt for faster analysis."""
         # SPEED OPTIMIZATION: Much shorter, focused prompt
         return f"""<|im_start|>system
-Security scan for {language} code. Find: SQL injection, XSS, auth issues, input validation, crypto problems, path traversal, command injection.
+Security scan for {language} code. Find: SQL injection, XSS, auth issues, 
+input validation, crypto problems, path traversal, command injection.
 
 Format each issue:
 ISSUE_START
@@ -590,7 +720,8 @@ Analyze: {file_path}
 
         files_to_analyze = list(repo_data["file_data"].items())
         print(
-            f"🔍 Analyzing {len(files_to_analyze)} files with vLLM batch processing..."
+            f"🔍 Analyzing {len(files_to_analyze)} files with "
+            f"vLLM batch processing..."
         )
 
         # Prepare all prompts for batch processing
@@ -834,6 +965,66 @@ def fastapi_app():
     @app.get("/health")
     async def health_check():
         """Health check endpoint."""
-        return {"status": "healthy", "model": "qwen3-security-dpo-4b"}
+        return {"status": "healthy", "model": MERGED_MODEL_NAME}
 
     return app
+
+
+# Additional helper functions for model management
+
+
+@app.function(timeout=300)
+def setup_model_cache():
+    """Setup function to initialize model cache. Run this once before using the analyzer."""
+    print("🚀 Setting up model cache...")
+
+    # Check if model is already cached
+    cache_status = check_model_cache.remote()
+
+    if cache_status["cached"]:
+        print(f"✅ Model already cached!")
+        print(
+            f"📊 Cache stats: {cache_status['file_count']} files, {cache_status['total_size_mb']:.1f} MB"
+        )
+        return cache_status
+    else:
+        print("📥 Model not cached, downloading...")
+        download_result = download_model_to_volume.remote()
+        return download_result
+
+
+@app.local_entrypoint()
+def test_cached_model():
+    print("🧪 Testing LLMGuard with cached model...")
+
+    # First ensure model is cached
+    print("🔍 Checking model cache...")
+    setup_result = setup_model_cache.remote()
+    print(f"Setup result: {setup_result}")
+
+    # Test repository
+    # test_repo = "https://github.com/WebGoat/WebGoat"
+    test_repo = "https://github.com/AdamSkog/Hadoop-DocuSearch"
+
+    print(f"🎯 Testing analysis on: {test_repo}")
+
+    # Fetch repository
+    repo_data = fetch_repository_contents_optimized.remote(test_repo)
+    print(f"📊 Fetched {len(repo_data['file_data'])} files")
+
+    # Analyze with cached model
+    analyzer = SecurityAnalyzer()
+    analysis = analyzer.analyze_repository_parallel.remote(repo_data)
+
+    print(f"\n🎉 Analysis Results:")
+    print(f"📁 Files scanned: {analysis.total_files_scanned}")
+    print(f"⚠️  Files with issues: {analysis.files_with_issues}")
+    print(f"🚨 Total issues found: {analysis.total_issues}")
+
+    # Show sample issues
+    for file_analysis in analysis.file_analyses[:3]:
+        if file_analysis.issues:
+            print(f"\n📄 {file_analysis.file_path}:")
+            for issue in file_analysis.issues[:2]:
+                print(f"  - {issue.severity}: {issue.vulnerability_type}")
+                print(f"    {issue.description}")
