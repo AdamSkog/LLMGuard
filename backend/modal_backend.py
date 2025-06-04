@@ -5,16 +5,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import modal
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Modal app configuration
 app = modal.App("llmguard-security-analyzer")
 
 # GPU configuration - Either T4 or A10G
-GPU_CONFIG = "T4"
+GPU_CONFIG = "A10G"
 
 # Model caching with Modal Volume
 model_volume = modal.Volume.from_name(
@@ -22,12 +18,12 @@ model_volume = modal.Volume.from_name(
 )
 MODEL_CACHE_PATH = "/models"
 
-# Container image with all dependencies
+# Container image with all dependencies - UPDATED FOR UNSLOTH
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         [
-            "vllm>=0.6.0",
+            "unsloth",
             "torch>=2.0.0",
             "transformers>=4.40.0",
             "fastapi>=0.100.0",
@@ -35,11 +31,13 @@ image = (
             "requests>=2.31.0",
             "PyGithub>=1.59.0",
             "tiktoken>=0.5.0",
-            "bitsandbytes>=0.45.3",  # Required for quantized models
-            "accelerate>=0.20.0",  # Required for model loading
-            "huggingface_hub>=0.19.0",  # For model downloading
-            "hf_transfer>=0.1.0",  # For fast HuggingFace downloads
-            "python-dotenv>=1.0.0",  # For environment variable loading
+            "bitsandbytes>=0.45.3",
+            "accelerate>=0.20.0",
+            "huggingface_hub>=0.19.0",
+            "hf_transfer>=0.1.0",
+            "python-dotenv>=1.0.0",
+            "peft>=0.8.0",  # For LoRA adapters
+            "xformers",  # For memory efficiency
         ]
     )
     .env(
@@ -50,8 +48,15 @@ image = (
     )
 )
 
+# Model configuration - UPDATED FOR UNSLOTH + LORA
+BASE_MODEL_NAME = "unsloth/Qwen3-4B-unsloth-bnb-4bit"
+LORA_ADAPTERS_NAME = "AdamDS/qwen3-security-dpo-4b"
+
 # Your merged model configuration
 MERGED_MODEL_NAME = "AdamDS/qwen3-security-merged-4b"
+
+# Create global SecurityAnalyzer instance at module level
+# security_analyzer = SecurityAnalyzer()  -> MOVE THIS AFTER CLASS DEFINITION
 
 
 @dataclass
@@ -90,51 +95,100 @@ class RepositoryAnalysis:
     secrets=[modal.Secret.from_name("github-token")],
     timeout=1800,  # 30 minutes for initial download
 )
-def download_model_to_volume():
+def download_base_model_to_volume():
     """
-    Download the merged security model to Modal Volume for caching.
-    This only needs to run once to populate the cache.
+    Download the base Unsloth model to Modal Volume for caching.
     """
-    import os
     from pathlib import Path
 
     from huggingface_hub import snapshot_download
 
-    print(f"🚀 Downloading merged model {MERGED_MODEL_NAME} to volume cache...")
+    print(f"🚀 Downloading base model {BASE_MODEL_NAME} to volume cache...")
     print(f"📁 Cache directory: {MODEL_CACHE_PATH}")
 
-    # Check if model is already cached
-    model_path = Path(MODEL_CACHE_PATH) / MERGED_MODEL_NAME.replace("/", "--")
+    # Check if base model is already cached
+    base_model_path = Path(MODEL_CACHE_PATH) / BASE_MODEL_NAME.replace("/", "--")
 
-    if model_path.exists() and any(model_path.iterdir()):
-        print("✅ Model already cached in volume!")
-        return {"status": "already_cached", "model_path": str(model_path)}
+    if base_model_path.exists() and any(base_model_path.iterdir()):
+        print("✅ Base model already cached in volume!")
+        return {"status": "already_cached", "model_path": str(base_model_path)}
 
     try:
-        # Download model to volume
+        # Download base model to volume
         local_model_path = snapshot_download(
-            repo_id=MERGED_MODEL_NAME,
-            local_dir=str(model_path),
-            ignore_patterns=["*.pt", "*.bin"],  # Use safetensors for efficiency
+            repo_id=BASE_MODEL_NAME,
+            local_dir=str(base_model_path),
+            ignore_patterns=["*.pt", "*.bin"],
             resume_download=True,
         )
 
         # Commit changes to volume
         model_volume.commit()
 
-        print(f"✅ Model downloaded successfully to {local_model_path}")
-        print(f"📊 Volume committed - model ready for fast loading!")
+        print(f"✅ Base model downloaded successfully to {local_model_path}")
+        print("📊 Volume committed - base model ready for fast loading!")
 
         return {
             "status": "downloaded",
             "model_path": local_model_path,
             "cached_size": sum(
-                f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+                f.stat().st_size for f in base_model_path.rglob("*") if f.is_file()
             ),
         }
 
     except Exception as e:
-        print(f"❌ Error downloading model: {e}")
+        print(f"❌ Error downloading base model: {e}")
+        raise
+
+
+@app.function(
+    image=image,
+    volumes={MODEL_CACHE_PATH: model_volume},
+    secrets=[modal.Secret.from_name("github-token")],
+    timeout=1800,
+)
+def download_lora_adapters_to_volume():
+    """
+    Download the LoRA adapters to Modal Volume for caching.
+    """
+    from pathlib import Path
+
+    from huggingface_hub import snapshot_download
+
+    print(f"🚀 Downloading LoRA adapters {LORA_ADAPTERS_NAME} to volume cache...")
+    print(f"📁 Cache directory: {MODEL_CACHE_PATH}")
+
+    # Check if LoRA adapters are already cached
+    lora_path = Path(MODEL_CACHE_PATH) / LORA_ADAPTERS_NAME.replace("/", "--")
+
+    if lora_path.exists() and any(lora_path.iterdir()):
+        print("✅ LoRA adapters already cached in volume!")
+        return {"status": "already_cached", "model_path": str(lora_path)}
+
+    try:
+        # Download LoRA adapters to volume
+        local_lora_path = snapshot_download(
+            repo_id=LORA_ADAPTERS_NAME,
+            local_dir=str(lora_path),
+            resume_download=True,
+        )
+
+        # Commit changes to volume
+        model_volume.commit()
+
+        print(f"✅ LoRA adapters downloaded successfully to {local_lora_path}")
+        print("📊 Volume committed - LoRA adapters ready for fast loading!")
+
+        return {
+            "status": "downloaded",
+            "model_path": local_lora_path,
+            "cached_size": sum(
+                f.stat().st_size for f in lora_path.rglob("*") if f.is_file()
+            ),
+        }
+
+    except Exception as e:
+        print(f"❌ Error downloading LoRA adapters: {e}")
         raise
 
 
@@ -144,23 +198,50 @@ def download_model_to_volume():
     timeout=300,
 )
 def check_model_cache():
-    """Check if model is cached and return cache status."""
+    """Check if both base model and LoRA adapters are cached."""
     from pathlib import Path
 
-    model_path = Path(MODEL_CACHE_PATH) / MERGED_MODEL_NAME.replace("/", "--")
+    base_model_path = Path(MODEL_CACHE_PATH) / BASE_MODEL_NAME.replace("/", "--")
+    lora_path = Path(MODEL_CACHE_PATH) / LORA_ADAPTERS_NAME.replace("/", "--")
 
-    if model_path.exists() and any(model_path.iterdir()):
-        file_count = len(list(model_path.rglob("*")))
-        total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+    base_cached = base_model_path.exists() and any(base_model_path.iterdir())
+    lora_cached = lora_path.exists() and any(lora_path.iterdir())
 
-        return {
-            "cached": True,
-            "model_path": str(model_path),
-            "file_count": file_count,
-            "total_size_mb": total_size / (1024 * 1024),
-        }
-    else:
-        return {"cached": False, "model_path": str(model_path)}
+    result = {
+        "base_model": {
+            "cached": base_cached,
+            "path": str(base_model_path),
+        },
+        "lora_adapters": {
+            "cached": lora_cached,
+            "path": str(lora_path),
+        },
+        "both_cached": base_cached and lora_cached,
+    }
+
+    if base_cached:
+        base_file_count = len(list(base_model_path.rglob("*")))
+        base_size = sum(
+            f.stat().st_size for f in base_model_path.rglob("*") if f.is_file()
+        )
+        result["base_model"].update(
+            {
+                "file_count": base_file_count,
+                "total_size_mb": base_size / (1024 * 1024),
+            }
+        )
+
+    if lora_cached:
+        lora_file_count = len(list(lora_path.rglob("*")))
+        lora_size = sum(f.stat().st_size for f in lora_path.rglob("*") if f.is_file())
+        result["lora_adapters"].update(
+            {
+                "file_count": lora_file_count,
+                "total_size_mb": lora_size / (1024 * 1024),
+            }
+        )
+
+    return result
 
 
 @app.function(
@@ -379,88 +460,111 @@ def detect_language(extension: str) -> str:
     volumes={MODEL_CACHE_PATH: model_volume},  # Mount the model cache volume
     gpu=GPU_CONFIG,
     scaledown_window=600,
-    timeout=3600,
+    timeout=7200,  # Increased to 2 hours for large repository analysis
 )
 class SecurityAnalyzer:
     # Use Modal parameters instead of __init__
-    model_name: str = modal.parameter(default=MERGED_MODEL_NAME)
+    base_model_name: str = modal.parameter(default=BASE_MODEL_NAME)
+    lora_adapters_name: str = modal.parameter(default=LORA_ADAPTERS_NAME)
 
     @modal.enter()
     def setup(self):
-        """Initialize with vLLM using cached merged model."""
+        """Initialize with Unsloth + LoRA adapters using cached models."""
         from pathlib import Path
 
-        print("🚀 Initializing SecurityAnalyzer with cached merged model...")
-        print(f"📥 Loading model: {self.model_name}")
+        import torch
+
+        print("🚀 Initializing SecurityAnalyzer with Unsloth + LoRA...")
+        print(f"📥 Base model: {self.base_model_name}")
+        print(f"🎯 LoRA adapters: {self.lora_adapters_name}")
         print(f"📁 Model cache path: {MODEL_CACHE_PATH}")
 
-        # Check if model is cached locally
-        model_path = Path(MODEL_CACHE_PATH) / self.model_name.replace("/", "--")
+        # Check if both models are cached locally
+        base_model_path = Path(MODEL_CACHE_PATH) / self.base_model_name.replace(
+            "/", "--"
+        )
+        lora_path = Path(MODEL_CACHE_PATH) / self.lora_adapters_name.replace("/", "--")
 
-        if not model_path.exists() or not any(model_path.iterdir()):
-            print(
-                "❌ Model not found in cache! Please run download_model_to_volume() first."
-            )
+        base_cached = base_model_path.exists() and any(base_model_path.iterdir())
+        lora_cached = lora_path.exists() and any(lora_path.iterdir())
+
+        if not base_cached:
+            print(f"❌ Base model not found in cache: {base_model_path}")
+            print("Please run download_base_model_to_volume() first.")
+        if not lora_cached:
+            print(f"❌ LoRA adapters not found in cache: {lora_path}")
+            print("Please run download_lora_adapters_to_volume() first.")
+
+        if not (base_cached and lora_cached):
             raise RuntimeError(
-                f"Model {self.model_name} not cached. Run download_model_to_volume() first."
+                "Required models not cached. Run download functions first."
             )
 
-        print(f"✅ Found cached model at: {model_path}")
+        print(f"✅ Found cached base model at: {base_model_path}")
+        print(f"✅ Found cached LoRA adapters at: {lora_path}")
 
         try:
-            from vllm import LLM, SamplingParams
+            from peft import PeftModel
+            from unsloth import FastLanguageModel
 
-            # Load the merged model directly from cache (no LoRA needed)
-            print("🔥 Loading merged model with vLLM...")
-            self.llm = LLM(
-                model=str(model_path),  # Load from local cache path
-                # Optimized settings for merged model on T4/A10G
-                gpu_memory_utilization=0.85,
-                max_model_len=2048,
-                max_num_batched_tokens=512,
-                max_num_seqs=4,
-                enforce_eager=True,
-                swap_space=4,
-                disable_log_stats=True,
-                trust_remote_code=True,  # May be needed for custom models
+            print("🔥 Loading base model with Unsloth...")
+
+            # Load base model from cache or HuggingFace
+            model_to_load = (
+                str(base_model_path) if base_cached else self.base_model_name
             )
 
-            # No LoRA needed since we're using the merged model
-            self.lora_request = None
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_to_load,
+                max_seq_length=2048,
+                dtype=None,  # Auto-detect
+                load_in_4bit=True,
+                trust_remote_code=True,
+            )
 
-            print("✅ Cached merged model loaded successfully!")
+            print("🎯 Loading LoRA adapters...")
+
+            # Load LoRA adapters from cache or HuggingFace
+            lora_to_load = str(lora_path) if lora_cached else self.lora_adapters_name
+
+            self.model = PeftModel.from_pretrained(self.model, lora_to_load)
+
+            print("⚡ Enabling fast inference...")
+            FastLanguageModel.for_inference(self.model)
+
+            # Get model device for later use
+            self.device = next(self.model.parameters()).device
+            print(f"🎮 Model loaded on device: {self.device}")
+
+            print("✅ Unsloth SecurityAnalyzer initialization complete!")
 
         except Exception as e:
-            print(f"❌ Error loading cached model: {str(e)}")
+            print(f"❌ Error loading models: {str(e)}")
             # Fallback: Try loading from HuggingFace directly
             print("🔄 Falling back to HuggingFace direct loading...")
             try:
-                self.llm = LLM(
-                    model=self.model_name,  # Load from HF
-                    gpu_memory_utilization=0.80,
-                    max_model_len=2048,
-                    max_num_batched_tokens=256,
-                    max_num_seqs=2,
-                    enforce_eager=True,
-                    swap_space=4,
-                    disable_log_stats=True,
+                from peft import PeftModel
+                from unsloth import FastLanguageModel
+
+                self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                    model_name=self.base_model_name,
+                    max_seq_length=2048,
+                    dtype=None,
+                    load_in_4bit=True,
+                    trust_remote_code=True,
                 )
-                self.lora_request = None
+
+                self.model = PeftModel.from_pretrained(
+                    self.model, self.lora_adapters_name
+                )
+                FastLanguageModel.for_inference(self.model)
+                self.device = next(self.model.parameters()).device
+
                 print("✅ Fallback model loading successful!")
 
             except Exception as e2:
                 print(f"❌ All loading strategies failed: {str(e2)}")
-                raise RuntimeError(f"Failed to load model: {str(e2)}")
-
-        # Optimized sampling parameters for speed
-        self.sampling_params = SamplingParams(
-            temperature=0.1,
-            max_tokens=256,
-            repetition_penalty=1.05,
-            stop=["</analysis>", "---END---", "<|im_end|>"],
-        )
-
-        print("✅ SecurityAnalyzer initialization complete!")
+                raise RuntimeError(f"Failed to load models: {str(e2)}")
 
     def analyze_file(
         self, file_path: str, file_content: str, language: str
@@ -504,9 +608,21 @@ class SecurityAnalyzer:
                 file_path, file_content, language
             )
 
-            # Generate analysis using vLLM
-            analysis_text = self._generate_with_vllm(prompt)
-            issues = self._parse_analysis(analysis_text, file_path)
+            # Generate analysis using Unsloth with timeout handling
+            import signal
+
+            def timeout_handler(signum, frame):
+                raise TimeoutError("File analysis timeout")
+
+            # Set timeout for individual file analysis (60 seconds)
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(60)
+
+            try:
+                analysis_text = self._generate_with_unsloth(prompt)
+                issues = self._parse_analysis(analysis_text, file_path)
+            finally:
+                signal.alarm(0)  # Cancel the alarm
 
             return FileAnalysis(
                 file_path=file_path,
@@ -515,6 +631,14 @@ class SecurityAnalyzer:
                 analysis_status="SUCCESS",
             )
 
+        except TimeoutError:
+            return FileAnalysis(
+                file_path=file_path,
+                language=language,
+                issues=[],
+                analysis_status="ERROR",
+                error_message="Analysis timeout (60s)",
+            )
         except Exception as e:
             return FileAnalysis(
                 file_path=file_path,
@@ -524,56 +648,77 @@ class SecurityAnalyzer:
                 error_message=str(e),
             )
 
-    def _generate_with_vllm(self, prompt: str) -> str:
-        """Generate analysis using vLLM - OPTIMIZED FOR SPEED."""
+    def _generate_with_unsloth(self, prompt: str) -> str:
+        """Generate analysis using Unsloth - OPTIMIZED FOR SPEED."""
         try:
-            # Generate with vLLM
-            outputs = self.llm.generate(
-                prompts=[prompt],
-                sampling_params=self.sampling_params,
-                lora_request=self.lora_request,  # None for merged model
-            )
+            import torch
 
-            # Extract generated text
-            analysis_text = outputs[0].outputs[0].text
-            return analysis_text.strip()
+            # Check if tokenizer exists (remove debug logs)
+            if not hasattr(self, "tokenizer"):
+                return "ERROR: SecurityAnalyzer not properly initialized"
+
+            if not hasattr(self, "model"):
+                return "ERROR: SecurityAnalyzer model not properly initialized"
+
+            # Tokenize and ensure tensors are on the same device as model
+            inputs = self.tokenizer([prompt], return_tensors="pt")
+
+            # Move inputs to the same device as the model
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,  # Reduced from 2048 to 512 for faster generation
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                    repetition_penalty=1.05,
+                )
+
+            # Decode the response
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+            # Extract just the generated part (after the prompt)
+            generated_text = response[len(prompt) :].strip()
+            return generated_text
 
         except Exception as e:
-            print(f"vLLM generation error: {e}")
-            return "NO_ISSUES_FOUND"
+            print(f"❌ Unsloth generation error: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return "ERROR: Generation failed"
 
     def _create_security_prompt_short(
         self, file_path: str, file_content: str, language: str
     ) -> str:
-        """Create a SHORTENED prompt for faster analysis."""
-        # SPEED OPTIMIZATION: Much shorter, focused prompt
-        return f"""<|im_start|>system
-Security scan for {language} code. Find: SQL injection, XSS, auth issues, 
-input validation, crypto problems, path traversal, command injection.
+        """Create a SHORTENED prompt for faster analysis using chat template."""
+        # Use proper chat template with thinking disabled for Qwen3
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a security scanner. Output ONLY the specified format. No explanations.\n\nSCAN FOR: SQL injection, XSS, auth issues, input validation, crypto problems, path traversal, command injection.\n\nOUTPUT FORMAT (use exactly this):\nISSUE_START\nFile: "
+                + file_path
+                + '\nLine: [number]\nSeverity: HIGH/MEDIUM/LOW\nType: [vulnerability_type]\nDescription: [brief_description]\nRecommendation: [fix]\nISSUE_END\n\nIf no issues: "NO_ISSUES_FOUND"\n\nDO NOT explain your reasoning. Output the format immediately.',
+            },
+            {
+                "role": "user",
+                "content": f"Scan this {language} code:\n\n```{language}\n{file_content}\n```",
+            },
+        ]
 
-Format each issue:
-ISSUE_START
-File: {file_path}
-Line: [number]
-Severity: HIGH/MEDIUM/LOW
-Type: [vulnerability_type]
-Description: [brief_description]
-Recommendation: [fix]
-ISSUE_END
+        # Apply chat template with thinking disabled for Qwen3
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,  # Disable Qwen3 thinking mode for speed
+        )
 
-If no issues: "NO_ISSUES_FOUND"
-<|im_end|>
-
-<|im_start|>user
-Analyze: {file_path}
-
-```{language}
-{file_content}
-```
-<|im_end|>
-
-<|im_start|>assistant
-"""
+        return prompt
 
     def _analyze_large_file(
         self, file_path: str, file_content: str, language: str
@@ -582,30 +727,18 @@ Analyze: {file_path}
         chunks = self._split_code_intelligently(file_content, language)
         all_issues = []
 
-        # Process chunks in batches for speed
-        chunk_prompts = []
+        # Process chunks sequentially for now (can be optimized later)
         for i, chunk in enumerate(chunks):
-            chunk_prompt = self._create_security_prompt_short(
-                f"{file_path} (chunk {i+1}/{len(chunks)})", chunk, language
-            )
-            chunk_prompts.append(chunk_prompt)
-
-        try:
-            # Batch process all chunks at once with vLLM
-            if chunk_prompts:
-                outputs = self.llm.generate(
-                    prompts=chunk_prompts,
-                    sampling_params=self.sampling_params,
-                    lora_request=self.lora_request,
+            try:
+                chunk_prompt = self._create_security_prompt_short(
+                    f"{file_path} (chunk {i+1}/{len(chunks)})", chunk, language
                 )
-
-                for output in outputs:
-                    analysis_text = output.outputs[0].text
-                    chunk_issues = self._parse_analysis(analysis_text, file_path)
-                    all_issues.extend(chunk_issues)
-
-        except Exception as e:
-            print(f"Error analyzing chunks of {file_path}: {e}")
+                analysis_text = self._generate_with_unsloth(chunk_prompt)
+                chunk_issues = self._parse_analysis(analysis_text, file_path)
+                all_issues.extend(chunk_issues)
+            except Exception as e:
+                print(f"Error analyzing chunk {i+1} of {file_path}: {e}")
+                continue
 
         return FileAnalysis(
             file_path=file_path,
@@ -709,119 +842,33 @@ Analyze: {file_path}
 
         return issues
 
-    @modal.method()
     def analyze_repository_parallel(
         self, repo_data: Dict[str, Any]
     ) -> RepositoryAnalysis:
-        """Analyze repository with PARALLEL BATCH PROCESSING using vLLM."""
-        file_analyses = []
-        total_issues = 0
+        """Analyze multiple files in a repository concurrently."""
+        print("🚀 Starting repository analysis...")
+        print(f"📁 Total files to analyze: {len(repo_data['file_data'])}")
+
+        files_to_analyze = [
+            (file_path, file_info)
+            for file_path, file_info in repo_data["file_data"].items()
+        ]
+
         files_with_issues = 0
+        total_issues = 0
+        file_analyses = []
 
-        files_to_analyze = list(repo_data["file_data"].items())
-        print(
-            f"🔍 Analyzing {len(files_to_analyze)} files with "
-            f"vLLM batch processing..."
-        )
-
-        # Prepare all prompts for batch processing
-        prompts = []
-        file_info_list = []
-
+        # Process files sequentially for now (Unsloth doesn't support batch like vLLM)
         for file_path, file_info in files_to_analyze:
-            # Apply same filtering logic as individual analysis
             content = file_info["content"]
             language = file_info["language"]
 
-            # Skip tiny files
-            if len(content.strip()) < 50:
-                file_analyses.append(
-                    FileAnalysis(
-                        file_path=file_path,
-                        language=language,
-                        issues=[],
-                        analysis_status="SKIPPED",
-                        error_message="File too small",
-                    )
-                )
-                continue
+            analysis = self.analyze_file(file_path, content, language)
+            file_analyses.append(analysis)
 
-            # Skip safe file patterns
-            safe_patterns = [
-                "test",
-                "spec",
-                "config",
-                "README",
-                "package.json",
-                "yarn.lock",
-            ]
-            if any(pattern.lower() in file_path.lower() for pattern in safe_patterns):
-                file_analyses.append(
-                    FileAnalysis(
-                        file_path=file_path,
-                        language=language,
-                        issues=[],
-                        analysis_status="SKIPPED",
-                        error_message="Low-risk file type",
-                    )
-                )
-                continue
-
-            # Skip large files for batch processing (handle separately)
-            if self._estimate_tokens(content) > 800:
-                analysis = self._analyze_large_file(file_path, content, language)
-                file_analyses.append(analysis)
-                if analysis.issues:
-                    files_with_issues += 1
-                    total_issues += len(analysis.issues)
-                continue
-
-            # Add to batch processing queue
-            prompt = self._create_security_prompt_short(file_path, content, language)
-            prompts.append(prompt)
-            file_info_list.append((file_path, language))
-
-        # BATCH PROCESS all suitable files at once with vLLM
-        if prompts:
-            print(f"🚀 Batch processing {len(prompts)} files with vLLM...")
-            try:
-                outputs = self.llm.generate(
-                    prompts=prompts,
-                    sampling_params=self.sampling_params,
-                    lora_request=self.lora_request,
-                )
-
-                # Process batch results
-                for i, output in enumerate(outputs):
-                    file_path, language = file_info_list[i]
-                    analysis_text = output.outputs[0].text
-                    issues = self._parse_analysis(analysis_text, file_path)
-
-                    analysis = FileAnalysis(
-                        file_path=file_path,
-                        language=language,
-                        issues=issues,
-                        analysis_status="SUCCESS",
-                    )
-                    file_analyses.append(analysis)
-
-                    if issues:
-                        files_with_issues += 1
-                        total_issues += len(issues)
-
-            except Exception as e:
-                print(f"Batch processing error: {e}")
-                # Fallback: mark all as errors
-                for file_path, language in file_info_list:
-                    file_analyses.append(
-                        FileAnalysis(
-                            file_path=file_path,
-                            language=language,
-                            issues=[],
-                            analysis_status="ERROR",
-                            error_message=str(e),
-                        )
-                    )
+            if analysis.issues:
+                files_with_issues += 1
+                total_issues += len(analysis.issues)
 
         print(
             f"✅ Analysis complete: {files_with_issues}/{len(files_to_analyze)} files with issues"
@@ -829,12 +876,318 @@ Analyze: {file_path}
 
         return RepositoryAnalysis(
             repository_url=repo_data["repository_url"],
-            total_files_scanned=len(repo_data["file_data"]),
+            total_files_scanned=len(files_to_analyze),
             files_with_issues=files_with_issues,
             total_issues=total_issues,
             file_analyses=file_analyses,
             repository_structure=repo_data["repository_structure"],
         )
+
+    def _generate_llm_recommendations(
+        self, vulnerability_types: Dict[str, int]
+    ) -> List[str]:
+        """Generate LLM-based recommendations for found vulnerabilities."""
+        if not vulnerability_types:
+            return [
+                "No security issues found. Continue following secure coding practices."
+            ]
+
+        # Create a prompt for generating recommendations
+        vuln_summary = ", ".join(
+            [
+                f"{count} {vuln_type} issues"
+                for vuln_type, count in vulnerability_types.items()
+            ]
+        )
+
+        # Use much more directive prompt to avoid extra text
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a security expert. Output ONLY numbered recommendations. No introduction. No explanations. Start immediately with '1.'",
+            },
+            {
+                "role": "user",
+                "content": f"Vulnerabilities found: {vuln_summary}. Output exactly 3 recommendations:\n\n1.\n2.\n3.",
+            },
+        ]
+
+        try:
+            # Apply chat template with thinking disabled
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,  # Disable thinking for speed
+            )
+
+            # Use higher token limit for recommendations to avoid truncation
+            import torch
+
+            inputs = self.tokenizer([prompt], return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=800,  # Reduced but still enough for 3 recommendations
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+
+            recommendations_text = self.tokenizer.decode(
+                outputs[0], skip_special_tokens=True
+            )
+            generated_part = recommendations_text[len(prompt) :].strip()
+
+            # Much more aggressive parsing to extract clean recommendations
+            recommendations = []
+
+            # Split by lines and process
+            lines = generated_part.split("\n")
+            current_recommendation = ""
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Check if this starts a new numbered recommendation
+                if any(line.startswith(f"{i}.") for i in range(1, 6)):
+                    # Save previous recommendation if exists
+                    if current_recommendation:
+                        recommendations.append(current_recommendation.strip())
+
+                    # Start new recommendation, remove number
+                    if line[1:2] == ".":
+                        current_recommendation = line[2:].strip()
+                    elif line[1:3] == ". ":
+                        current_recommendation = line[3:].strip()
+                    else:
+                        current_recommendation = line
+                else:
+                    # Continue previous recommendation
+                    if current_recommendation:
+                        current_recommendation += " " + line
+
+            # Don't forget the last recommendation
+            if current_recommendation:
+                recommendations.append(current_recommendation.strip())
+
+            # Clean up and filter recommendations
+            clean_recommendations = []
+            for rec in recommendations:
+                # Remove common prefixes and clean up
+                rec = rec.strip("- •*").strip()
+                if rec.startswith("**"):
+                    rec = rec.strip("*").strip()
+
+                # Only keep substantial recommendations
+                if len(rec) > 20 and not rec.lower().startswith(
+                    ("here", "based", "the following", "to address")
+                ):
+                    clean_recommendations.append(rec)
+
+            # Ensure we have at least some recommendations
+            if not clean_recommendations:
+                print("⚠️ LLM recommendations parsing failed, using fallback")
+                return generate_fallback_recommendations(vulnerability_types)
+
+            # Limit to 3 recommendations max
+            return clean_recommendations[:3]
+
+        except Exception as e:
+            print(f"❌ Error generating LLM recommendations: {e}")
+            # Fallback to basic recommendations
+            return generate_fallback_recommendations(vulnerability_types)
+
+    @modal.fastapi_endpoint(method="POST", label="analyze-repository")
+    def analyze_repository_endpoint(self, request: Dict):
+        """Native Modal web endpoint for repository analysis."""
+        try:
+            repository_url = request.get("repository_url")
+            if not repository_url:
+                return {"error": "repository_url is required"}
+
+            print(f"🔍 Analyzing repository: {repository_url}")
+
+            # Fetch repository data
+            repo_data = fetch_repository_contents_optimized.remote(repository_url)
+
+            # Call analysis method differently to avoid Function object issue
+            analysis = self._perform_repository_analysis(repo_data)
+
+            # Generate summary statistics
+            severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+            vulnerability_types = {}
+
+            for file_analysis in analysis.file_analyses:
+                for issue in file_analysis.issues:
+                    severity_counts[issue.severity] = (
+                        severity_counts.get(issue.severity, 0) + 1
+                    )
+                    vuln_type = issue.vulnerability_type
+                    vulnerability_types[vuln_type] = (
+                        vulnerability_types.get(vuln_type, 0) + 1
+                    )
+
+            analysis_summary = {
+                "severity_breakdown": severity_counts,
+                "vulnerability_types": vulnerability_types,
+                "risk_score": calculate_risk_score(severity_counts),
+                "recommendations": self._generate_llm_recommendations(
+                    vulnerability_types
+                ),
+                "fetch_time": repo_data.get("fetch_time", 0),
+            }
+
+            return {
+                "repository_url": analysis.repository_url,
+                "total_files_scanned": analysis.total_files_scanned,
+                "files_with_issues": analysis.files_with_issues,
+                "total_issues": analysis.total_issues,
+                "file_analyses": [fa.__dict__ for fa in analysis.file_analyses],
+                "repository_structure": analysis.repository_structure,
+                "analysis_summary": analysis_summary,
+            }
+
+        except Exception as e:
+            print(f"❌ Analysis error: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"error": f"Analysis failed: {str(e)}"}
+
+    def _perform_repository_analysis(
+        self, repo_data: Dict[str, Any]
+    ) -> RepositoryAnalysis:
+        """Internal method to perform repository analysis - avoids Modal Function object issues."""
+        print("🚀 Starting repository analysis...")
+        print(f"📁 Total files to analyze: {len(repo_data['file_data'])}")
+
+        files_to_analyze = [
+            (file_path, file_info)
+            for file_path, file_info in repo_data["file_data"].items()
+        ]
+
+        files_with_issues = 0
+        total_issues = 0
+        file_analyses = []
+
+        # Process files sequentially with progress tracking
+        for i, (file_path, file_info) in enumerate(files_to_analyze, 1):
+            print(f"📄 Analyzing file {i}/{len(files_to_analyze)}: {file_path}")
+            content = file_info["content"]
+            language = file_info["language"]
+
+            analysis = self.analyze_file(file_path, content, language)
+            file_analyses.append(analysis)
+
+            if analysis.issues:
+                files_with_issues += 1
+                total_issues += len(analysis.issues)
+                print(f"   ⚠️  Found {len(analysis.issues)} issues")
+            else:
+                print("   ✅ No issues found")
+
+        print(
+            f"✅ Analysis complete: {files_with_issues}/{len(files_to_analyze)} files with issues"
+        )
+
+        return RepositoryAnalysis(
+            repository_url=repo_data["repository_url"],
+            total_files_scanned=len(files_to_analyze),
+            files_with_issues=files_with_issues,
+            total_issues=total_issues,
+            file_analyses=file_analyses,
+            repository_structure=repo_data["repository_structure"],
+        )
+
+    @modal.fastapi_endpoint(method="POST", label="analyze-file")
+    def analyze_file_endpoint(self, request: Dict):
+        """Native Modal web endpoint for single file analysis."""
+        try:
+            file_path = request.get("file_path", "unknown.py")
+            file_content = request.get("file_content", "")
+            language = request.get("language", "python")
+
+            if not file_content:
+                return {"error": "file_content is required"}
+
+            print(f"🔍 Analyzing file: {file_path}")
+
+            # Analyze with this class instance
+            analysis = self.analyze_file(file_path, file_content, language)
+
+            return {
+                "file_path": analysis.file_path,
+                "language": analysis.language,
+                "analysis_status": analysis.analysis_status,
+                "issues_found": len(analysis.issues),
+                "issues": [issue.__dict__ for issue in analysis.issues],
+                "error_message": analysis.error_message,
+            }
+
+        except Exception as e:
+            print(f"❌ File analysis error: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"error": f"File analysis failed: {str(e)}"}
+
+    @modal.fastapi_endpoint(method="POST", label="debug-analysis")
+    def debug_analysis_endpoint(self, request: Dict):
+        """Debug endpoint to see raw model output."""
+        try:
+            file_path = request.get("file_path", "unknown.py")
+            file_content = request.get("file_content", "")
+            language = request.get("language", "python")
+
+            if not file_content:
+                return {"error": "file_content is required"}
+
+            print(f"🔍 Debug analyzing file: {file_path}")
+
+            # Create the prompt
+            prompt = self._create_security_prompt_short(
+                file_path, file_content, language
+            )
+
+            # Generate raw analysis
+            raw_analysis = self._generate_with_unsloth(prompt)
+
+            # Try to parse it
+            parsed_issues = self._parse_analysis(raw_analysis, file_path)
+
+            return {
+                "file_path": file_path,
+                "language": language,
+                "prompt": prompt,
+                "raw_model_output": raw_analysis,
+                "parsed_issues_count": len(parsed_issues),
+                "parsed_issues": [issue.__dict__ for issue in parsed_issues],
+                "contains_no_issues": "NO_ISSUES_FOUND" in raw_analysis,
+            }
+
+        except Exception as e:
+            print(f"❌ Debug analysis error: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"error": f"Debug analysis failed: {str(e)}"}
+
+    @modal.fastapi_endpoint(method="GET", label="health")
+    def health_endpoint(self):
+        """Native Modal health check endpoint."""
+        return {
+            "status": "healthy",
+            "base_model": BASE_MODEL_NAME,
+            "lora_adapters": LORA_ADAPTERS_NAME,
+            "gpu_available": str(self.device) if hasattr(self, "device") else "unknown",
+        }
 
 
 def calculate_risk_score(severity_counts: Dict[str, int]) -> int:
@@ -853,20 +1206,20 @@ def calculate_risk_score(severity_counts: Dict[str, int]) -> int:
     return min(100, int((total_score / max_possible_score) * 100))
 
 
-def generate_general_recommendations(vulnerability_types: Dict[str, int]) -> List[str]:
-    """Generate general security recommendations."""
+def generate_fallback_recommendations(vulnerability_types: Dict[str, int]) -> List[str]:
+    """Generate fallback security recommendations when LLM fails."""
     recommendations = []
 
-    if "SQL Injection" in vulnerability_types:
+    if "SQL Injection" in vulnerability_types or "SQL_INJECTION" in vulnerability_types:
         recommendations.append("Implement parameterized queries and input validation")
 
-    if "Cross-Site Scripting" in vulnerability_types:
+    if "Cross-Site Scripting" in vulnerability_types or "XSS" in vulnerability_types:
         recommendations.append("Sanitize and escape all user inputs")
 
-    if "Authentication" in vulnerability_types:
+    if "Authentication" in vulnerability_types or "AUTH" in vulnerability_types:
         recommendations.append("Strengthen authentication and session management")
 
-    if "Cryptographic" in vulnerability_types:
+    if "Cryptographic" in vulnerability_types or "CRYPTO" in vulnerability_types:
         recommendations.append("Use strong encryption and secure key management")
 
     if not recommendations:
@@ -876,134 +1229,22 @@ def generate_general_recommendations(vulnerability_types: Dict[str, int]) -> Lis
 
 
 @app.function(
-    image=image.pip_install(["fastapi", "uvicorn"]),
-    timeout=3600,
+    image=image,
+    volumes={MODEL_CACHE_PATH: model_volume},
+    gpu=GPU_CONFIG,
+    secrets=[modal.Secret.from_name("github-token")],
+    timeout=1800,
 )
-@modal.concurrent(max_inputs=10)
-@modal.asgi_app()
-def fastapi_app():
-    from fastapi import FastAPI, HTTPException
-    from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel
-
-    app = FastAPI(title="LLMGuard Security Analyzer API")
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    class AnalysisRequest(BaseModel):
-        repository_url: str
-
-    class AnalysisResponse(BaseModel):
-        repository_url: str
-        total_files_scanned: int
-        files_with_issues: int
-        total_issues: int
-        file_analyses: List[Dict]
-        repository_structure: Dict
-        analysis_summary: Dict
-
-    @app.post("/analyze", response_model=AnalysisResponse)
-    async def analyze_repository(request: AnalysisRequest):
-        """Main endpoint for repository security analysis."""
-        try:
-            # Step 1: Fetch repository contents (optimized)
-            print(f"Fetching repository: {request.repository_url}")
-            repo_data = fetch_repository_contents_optimized.remote(
-                request.repository_url
-            )
-
-            # Step 2: Analyze with security model
-            print("Starting security analysis...")
-            analyzer = SecurityAnalyzer()
-            analysis = analyzer.analyze_repository_parallel.remote(repo_data)
-
-            # Step 3: Generate summary statistics
-            severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-            vulnerability_types = {}
-
-            for file_analysis in analysis.file_analyses:
-                for issue in file_analysis.issues:
-                    severity_counts[issue.severity] = (
-                        severity_counts.get(issue.severity, 0) + 1
-                    )
-                    vuln_type = issue.vulnerability_type
-                    vulnerability_types[vuln_type] = (
-                        vulnerability_types.get(vuln_type, 0) + 1
-                    )
-
-            analysis_summary = {
-                "severity_breakdown": severity_counts,
-                "vulnerability_types": vulnerability_types,
-                "risk_score": calculate_risk_score(severity_counts),
-                "recommendations": generate_general_recommendations(
-                    vulnerability_types
-                ),
-                "fetch_time": repo_data.get("fetch_time", 0),
-            }
-
-            return AnalysisResponse(
-                repository_url=analysis.repository_url,
-                total_files_scanned=analysis.total_files_scanned,
-                files_with_issues=analysis.files_with_issues,
-                total_issues=analysis.total_issues,
-                file_analyses=[
-                    file_analysis.__dict__ for file_analysis in analysis.file_analyses
-                ],
-                repository_structure=analysis.repository_structure,
-                analysis_summary=analysis_summary,
-            )
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint."""
-        return {"status": "healthy", "model": MERGED_MODEL_NAME}
-
-    return app
-
-
-# Additional helper functions for model management
-
-
-@app.function(timeout=300)
-def setup_model_cache():
-    """Setup function to initialize model cache. Run this once before using the analyzer."""
-    print("🚀 Setting up model cache...")
-
-    # Check if model is already cached
-    cache_status = check_model_cache.remote()
-
-    if cache_status["cached"]:
-        print(f"✅ Model already cached!")
-        print(
-            f"📊 Cache stats: {cache_status['file_count']} files, {cache_status['total_size_mb']:.1f} MB"
-        )
-        return cache_status
-    else:
-        print("📥 Model not cached, downloading...")
-        download_result = download_model_to_volume.remote()
-        return download_result
-
-
-@app.local_entrypoint()
-def test_cached_model():
-    print("🧪 Testing LLMGuard with cached model...")
+def test_repository_analysis():
+    """Test repository analysis using SecurityAnalyzer class methods directly."""
+    print("🧪 Testing repository analysis on Modal servers...")
 
     # First ensure model is cached
     print("🔍 Checking model cache...")
     setup_result = setup_model_cache.remote()
     print(f"Setup result: {setup_result}")
 
-    # Test repository
-    # test_repo = "https://github.com/WebGoat/WebGoat"
+    # Test repository - use a smaller repo for faster testing
     test_repo = "https://github.com/AdamSkog/Hadoop-DocuSearch"
 
     print(f"🎯 Testing analysis on: {test_repo}")
@@ -1012,19 +1253,34 @@ def test_cached_model():
     repo_data = fetch_repository_contents_optimized.remote(test_repo)
     print(f"📊 Fetched {len(repo_data['file_data'])} files")
 
-    # Analyze with cached model
-    analyzer = SecurityAnalyzer()
-    analysis = analyzer.analyze_repository_parallel.remote(repo_data)
+    # Use SecurityAnalyzer class method directly
+    print("🚀 Starting security analysis with SecurityAnalyzer class method...")
+    analysis = SecurityAnalyzer()._perform_repository_analysis(repo_data)
 
-    print(f"\n🎉 Analysis Results:")
+    print("\n🎉 Analysis Results:")
     print(f"📁 Files scanned: {analysis.total_files_scanned}")
     print(f"⚠️  Files with issues: {analysis.files_with_issues}")
     print(f"🚨 Total issues found: {analysis.total_issues}")
 
     # Show sample issues
-    for file_analysis in analysis.file_analyses[:3]:
-        if file_analysis.issues:
+    issues_shown = 0
+    for file_analysis in analysis.file_analyses:
+        if file_analysis.issues and issues_shown < 5:  # Show max 5 issues
             print(f"\n📄 {file_analysis.file_path}:")
-            for issue in file_analysis.issues[:2]:
+            for issue in file_analysis.issues[:2]:  # Max 2 issues per file
                 print(f"  - {issue.severity}: {issue.vulnerability_type}")
-                print(f"    {issue.description}")
+                print(f"    {issue.description[:100]}...")
+                issues_shown += 1
+                if issues_shown >= 5:
+                    break
+
+    # Test performance
+    print("\n⏱️  Performance Stats:")
+    print(f"  Repository fetch time: {repo_data.get('fetch_time', 0):.2f}s")
+
+    return {
+        "test_status": "SUCCESS",
+        "files_scanned": analysis.total_files_scanned,
+        "issues_found": analysis.total_issues,
+        "fetch_time": repo_data.get("fetch_time", 0),
+    }
