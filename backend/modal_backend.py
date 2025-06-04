@@ -69,6 +69,18 @@ class SecurityIssue:
     recommendation: str
     code_snippet: Optional[str] = None
 
+    def to_dict(self):
+        """Convert SecurityIssue to dictionary for JSON serialization."""
+        return {
+            "file_path": self.file_path,
+            "line_number": self.line_number,
+            "severity": self.severity,
+            "vulnerability_type": self.vulnerability_type,
+            "description": self.description,
+            "recommendation": self.recommendation,
+            "code_snippet": self.code_snippet,
+        }
+
 
 @dataclass
 class FileAnalysis:
@@ -77,6 +89,16 @@ class FileAnalysis:
     issues: List[SecurityIssue]
     analysis_status: str  # "SUCCESS", "SKIPPED", "ERROR", "TRUNCATED"
     error_message: Optional[str] = None
+
+    def to_dict(self):
+        """Convert FileAnalysis to dictionary for JSON serialization."""
+        return {
+            "file_path": self.file_path,
+            "language": self.language,
+            "issues": [issue.to_dict() for issue in self.issues],
+            "analysis_status": self.analysis_status,
+            "error_message": self.error_message,
+        }
 
 
 @dataclass
@@ -472,8 +494,6 @@ class SecurityAnalyzer:
         """Initialize with Unsloth + LoRA adapters using cached models."""
         from pathlib import Path
 
-        import torch
-
         print("🚀 Initializing SecurityAnalyzer with Unsloth + LoRA...")
         print(f"📥 Base model: {self.base_model_name}")
         print(f"🎯 LoRA adapters: {self.lora_adapters_name}")
@@ -571,8 +591,11 @@ class SecurityAnalyzer:
     ) -> FileAnalysis:
         """Analyze a single file for security vulnerabilities - OPTIMIZED."""
         try:
+            print(f"🔍 Starting analysis of {file_path} ({language})")
+
             # SPEED OPTIMIZATION: Skip tiny files and non-risky file types
             if len(file_content.strip()) < 50:
+                print(f"⏭️  Skipping {file_path}: file too small")
                 return FileAnalysis(
                     file_path=file_path,
                     language=language,
@@ -591,6 +614,7 @@ class SecurityAnalyzer:
                 "yarn.lock",
             ]
             if any(pattern.lower() in file_path.lower() for pattern in safe_patterns):
+                print(f"⏭️  Skipping {file_path}: low-risk file type")
                 return FileAnalysis(
                     file_path=file_path,
                     language=language,
@@ -601,6 +625,7 @@ class SecurityAnalyzer:
 
             # Check if file is too large for context window
             if self._estimate_tokens(file_content) > 800:
+                print(f"📄 {file_path}: Large file, using chunking")
                 return self._analyze_large_file(file_path, file_content, language)
 
             # Create shortened security analysis prompt
@@ -608,21 +633,13 @@ class SecurityAnalyzer:
                 file_path, file_content, language
             )
 
-            # Generate analysis using Unsloth with timeout handling
-            import signal
+            print(f"🤖 Generating analysis for {file_path}")
 
-            def timeout_handler(signum, frame):
-                raise TimeoutError("File analysis timeout")
-
-            # Set timeout for individual file analysis (60 seconds)
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(60)
-
-            try:
-                analysis_text = self._generate_with_unsloth(prompt)
-                issues = self._parse_analysis(analysis_text, file_path)
-            finally:
-                signal.alarm(0)  # Cancel the alarm
+            # Generate analysis using Unsloth (removed signal-based timeout)
+            analysis_text = self._generate_with_unsloth(prompt)
+            print(f"📝 Raw analysis for {file_path}: {analysis_text[:200]}...")
+            issues = self._parse_analysis(analysis_text, file_path)
+            print(f"✅ Found {len(issues)} issues in {file_path}")
 
             return FileAnalysis(
                 file_path=file_path,
@@ -631,15 +648,8 @@ class SecurityAnalyzer:
                 analysis_status="SUCCESS",
             )
 
-        except TimeoutError:
-            return FileAnalysis(
-                file_path=file_path,
-                language=language,
-                issues=[],
-                analysis_status="ERROR",
-                error_message="Analysis timeout (60s)",
-            )
         except Exception as e:
+            print(f"❌ Error analyzing {file_path}: {e}")
             return FileAnalysis(
                 file_path=file_path,
                 language=language,
@@ -1004,62 +1014,113 @@ class SecurityAnalyzer:
             # Fallback to basic recommendations
             return generate_fallback_recommendations(vulnerability_types)
 
-    @modal.fastapi_endpoint(method="POST", label="analyze-repository")
+    @modal.fastapi_endpoint(method=["POST", "OPTIONS"], label="analyze-repository")
     def analyze_repository_endpoint(self, request: Dict):
-        """Native Modal web endpoint for repository analysis."""
+        """Modal web endpoint for repository analysis with CORS support."""
         try:
+            # Handle CORS preflight
+            from fastapi import Request
+            from fastapi.responses import JSONResponse
+
+            # Check if this is an OPTIONS request
+            if hasattr(request, "method") and request.method == "OPTIONS":
+                response = JSONResponse(content={})
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                response.headers["Access-Control-Max-Age"] = "86400"
+                return response
+
             repository_url = request.get("repository_url")
             if not repository_url:
-                return {"error": "repository_url is required"}
+                response = {"error": "repository_url is required"}
+            else:
+                print(f"🔍 Analyzing repository: {repository_url}")
 
-            print(f"🔍 Analyzing repository: {repository_url}")
+                # Check model initialization
+                if not hasattr(self, "model") or not hasattr(self, "tokenizer"):
+                    print("❌ Model not properly initialized!")
+                    response = {"error": "Security analyzer model not initialized"}
+                else:
+                    print("✅ Model and tokenizer are initialized")
+                    print(f"📊 Model device: {getattr(self, 'device', 'unknown')}")
 
-            # Fetch repository data
-            repo_data = fetch_repository_contents_optimized.remote(repository_url)
-
-            # Call analysis method differently to avoid Function object issue
-            analysis = self._perform_repository_analysis(repo_data)
-
-            # Generate summary statistics
-            severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-            vulnerability_types = {}
-
-            for file_analysis in analysis.file_analyses:
-                for issue in file_analysis.issues:
-                    severity_counts[issue.severity] = (
-                        severity_counts.get(issue.severity, 0) + 1
+                    # Fetch repository data
+                    repo_data = fetch_repository_contents_optimized.remote(
+                        repository_url
                     )
-                    vuln_type = issue.vulnerability_type
-                    vulnerability_types[vuln_type] = (
-                        vulnerability_types.get(vuln_type, 0) + 1
+                    print(
+                        f"📁 Fetched {len(repo_data['file_data'])} files for analysis"
                     )
 
-            analysis_summary = {
-                "severity_breakdown": severity_counts,
-                "vulnerability_types": vulnerability_types,
-                "risk_score": calculate_risk_score(severity_counts),
-                "recommendations": self._generate_llm_recommendations(
-                    vulnerability_types
-                ),
-                "fetch_time": repo_data.get("fetch_time", 0),
-            }
+                    # Call analysis method differently to avoid Function object issue
+                    analysis = self._perform_repository_analysis(repo_data)
 
-            return {
-                "repository_url": analysis.repository_url,
-                "total_files_scanned": analysis.total_files_scanned,
-                "files_with_issues": analysis.files_with_issues,
-                "total_issues": analysis.total_issues,
-                "file_analyses": [fa.__dict__ for fa in analysis.file_analyses],
-                "repository_structure": analysis.repository_structure,
-                "analysis_summary": analysis_summary,
-            }
+                    print(
+                        f"🔍 Analysis results: {analysis.total_issues} total issues found"
+                    )
+                    print(f"📄 Files with issues: {analysis.files_with_issues}")
+
+                    # Generate summary statistics
+                    severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+                    vulnerability_types = {}
+
+                    for file_analysis in analysis.file_analyses:
+                        for issue in file_analysis.issues:
+                            severity_counts[issue.severity] = (
+                                severity_counts.get(issue.severity, 0) + 1
+                            )
+                            vuln_type = issue.vulnerability_type
+                            vulnerability_types[vuln_type] = (
+                                vulnerability_types.get(vuln_type, 0) + 1
+                            )
+
+                    analysis_summary = {
+                        "severity_breakdown": severity_counts,
+                        "vulnerability_types": vulnerability_types,
+                        "risk_score": calculate_risk_score(severity_counts),
+                        "recommendations": self._generate_llm_recommendations(
+                            vulnerability_types
+                        ),
+                        "fetch_time": repo_data.get("fetch_time", 0),
+                    }
+
+                    response = {
+                        "repository_url": analysis.repository_url,
+                        "total_files_scanned": analysis.total_files_scanned,
+                        "files_with_issues": analysis.files_with_issues,
+                        "total_issues": analysis.total_issues,
+                        "file_analyses": [
+                            fa.to_dict() for fa in analysis.file_analyses
+                        ],
+                        "repository_structure": analysis.repository_structure,
+                        "analysis_summary": analysis_summary,
+                    }
+
+            # Create response with CORS headers
+            json_response = JSONResponse(content=response)
+            json_response.headers["Access-Control-Allow-Origin"] = "*"
+            json_response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            json_response.headers["Access-Control-Allow-Headers"] = "*"
+
+            return json_response
 
         except Exception as e:
             print(f"❌ Analysis error: {e}")
             import traceback
 
             traceback.print_exc()
-            return {"error": f"Analysis failed: {str(e)}"}
+
+            error_response = JSONResponse(
+                content={"error": f"Analysis failed: {str(e)}"}
+            )
+            error_response.headers["Access-Control-Allow-Origin"] = "*"
+            error_response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, OPTIONS"
+            )
+            error_response.headers["Access-Control-Allow-Headers"] = "*"
+
+            return error_response
 
     def _perform_repository_analysis(
         self, repo_data: Dict[str, Any]
@@ -1106,88 +1167,162 @@ class SecurityAnalyzer:
             repository_structure=repo_data["repository_structure"],
         )
 
-    @modal.fastapi_endpoint(method="POST", label="analyze-file")
+    @modal.fastapi_endpoint(method=["POST", "OPTIONS"], label="analyze-file")
     def analyze_file_endpoint(self, request: Dict):
-        """Native Modal web endpoint for single file analysis."""
+        """Modal web endpoint for single file analysis with CORS support."""
         try:
+            from fastapi.responses import JSONResponse
+
+            # Handle CORS preflight
+            if hasattr(request, "method") and request.method == "OPTIONS":
+                response = JSONResponse(content={})
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                response.headers["Access-Control-Max-Age"] = "86400"
+                return response
+
             file_path = request.get("file_path", "unknown.py")
             file_content = request.get("file_content", "")
             language = request.get("language", "python")
 
             if not file_content:
-                return {"error": "file_content is required"}
+                response = {"error": "file_content is required"}
+            else:
+                print(f"🔍 Analyzing file: {file_path}")
 
-            print(f"🔍 Analyzing file: {file_path}")
+                # Analyze with this class instance
+                analysis = self.analyze_file(file_path, file_content, language)
 
-            # Analyze with this class instance
-            analysis = self.analyze_file(file_path, file_content, language)
+                response = {
+                    "file_path": analysis.file_path,
+                    "language": analysis.language,
+                    "analysis_status": analysis.analysis_status,
+                    "issues_found": len(analysis.issues),
+                    "issues": [issue.to_dict() for issue in analysis.issues],
+                    "error_message": analysis.error_message,
+                }
 
-            return {
-                "file_path": analysis.file_path,
-                "language": analysis.language,
-                "analysis_status": analysis.analysis_status,
-                "issues_found": len(analysis.issues),
-                "issues": [issue.__dict__ for issue in analysis.issues],
-                "error_message": analysis.error_message,
-            }
+            json_response = JSONResponse(content=response)
+            json_response.headers["Access-Control-Allow-Origin"] = "*"
+            json_response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            json_response.headers["Access-Control-Allow-Headers"] = "*"
+
+            return json_response
 
         except Exception as e:
             print(f"❌ File analysis error: {e}")
             import traceback
 
             traceback.print_exc()
-            return {"error": f"File analysis failed: {str(e)}"}
 
-    @modal.fastapi_endpoint(method="POST", label="debug-analysis")
+            error_response = JSONResponse(
+                content={"error": f"File analysis failed: {str(e)}"}
+            )
+            error_response.headers["Access-Control-Allow-Origin"] = "*"
+            error_response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, OPTIONS"
+            )
+            error_response.headers["Access-Control-Allow-Headers"] = "*"
+
+            return error_response
+
+    @modal.fastapi_endpoint(method=["POST", "OPTIONS"], label="debug-analysis")
     def debug_analysis_endpoint(self, request: Dict):
-        """Debug endpoint to see raw model output."""
+        """Debug endpoint to see raw model output with CORS support."""
         try:
+            from fastapi.responses import JSONResponse
+
+            # Handle CORS preflight
+            if hasattr(request, "method") and request.method == "OPTIONS":
+                response = JSONResponse(content={})
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                response.headers["Access-Control-Max-Age"] = "86400"
+                return response
+
             file_path = request.get("file_path", "unknown.py")
             file_content = request.get("file_content", "")
             language = request.get("language", "python")
 
             if not file_content:
-                return {"error": "file_content is required"}
+                response = {"error": "file_content is required"}
+            else:
+                print(f"🔍 Debug analyzing file: {file_path}")
 
-            print(f"🔍 Debug analyzing file: {file_path}")
+                # Create the prompt
+                prompt = self._create_security_prompt_short(
+                    file_path, file_content, language
+                )
 
-            # Create the prompt
-            prompt = self._create_security_prompt_short(
-                file_path, file_content, language
-            )
+                # Generate raw analysis
+                raw_analysis = self._generate_with_unsloth(prompt)
 
-            # Generate raw analysis
-            raw_analysis = self._generate_with_unsloth(prompt)
+                # Try to parse it
+                parsed_issues = self._parse_analysis(raw_analysis, file_path)
 
-            # Try to parse it
-            parsed_issues = self._parse_analysis(raw_analysis, file_path)
+                response = {
+                    "file_path": file_path,
+                    "language": language,
+                    "prompt": prompt,
+                    "raw_model_output": raw_analysis,
+                    "parsed_issues_count": len(parsed_issues),
+                    "parsed_issues": [issue.to_dict() for issue in parsed_issues],
+                    "contains_no_issues": "NO_ISSUES_FOUND" in raw_analysis,
+                }
 
-            return {
-                "file_path": file_path,
-                "language": language,
-                "prompt": prompt,
-                "raw_model_output": raw_analysis,
-                "parsed_issues_count": len(parsed_issues),
-                "parsed_issues": [issue.__dict__ for issue in parsed_issues],
-                "contains_no_issues": "NO_ISSUES_FOUND" in raw_analysis,
-            }
+            json_response = JSONResponse(content=response)
+            json_response.headers["Access-Control-Allow-Origin"] = "*"
+            json_response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            json_response.headers["Access-Control-Allow-Headers"] = "*"
+
+            return json_response
 
         except Exception as e:
             print(f"❌ Debug analysis error: {e}")
             import traceback
 
             traceback.print_exc()
-            return {"error": f"Debug analysis failed: {str(e)}"}
 
-    @modal.fastapi_endpoint(method="GET", label="health")
+            error_response = JSONResponse(
+                content={"error": f"Debug analysis failed: {str(e)}"}
+            )
+            error_response.headers["Access-Control-Allow-Origin"] = "*"
+            error_response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, OPTIONS"
+            )
+            error_response.headers["Access-Control-Allow-Headers"] = "*"
+
+            return error_response
+
+    @modal.fastapi_endpoint(method=["GET", "OPTIONS"], label="health")
     def health_endpoint(self):
-        """Native Modal health check endpoint."""
-        return {
+        """Modal health check endpoint with CORS support."""
+        from fastapi.responses import JSONResponse
+
+        # Handle CORS preflight
+        if hasattr(self, "method") and self.method == "OPTIONS":
+            response = JSONResponse(content={})
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Max-Age"] = "86400"
+            return response
+
+        response = {
             "status": "healthy",
             "base_model": BASE_MODEL_NAME,
             "lora_adapters": LORA_ADAPTERS_NAME,
             "gpu_available": str(self.device) if hasattr(self, "device") else "unknown",
         }
+
+        json_response = JSONResponse(content=response)
+        json_response.headers["Access-Control-Allow-Origin"] = "*"
+        json_response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        json_response.headers["Access-Control-Allow-Headers"] = "*"
+
+        return json_response
 
 
 def calculate_risk_score(severity_counts: Dict[str, int]) -> int:
@@ -1239,11 +1374,6 @@ def test_repository_analysis():
     """Test repository analysis using SecurityAnalyzer class methods directly."""
     print("🧪 Testing repository analysis on Modal servers...")
 
-    # First ensure model is cached
-    print("🔍 Checking model cache...")
-    setup_result = setup_model_cache.remote()
-    print(f"Setup result: {setup_result}")
-
     # Test repository - use a smaller repo for faster testing
     test_repo = "https://github.com/AdamSkog/Hadoop-DocuSearch"
 
@@ -1253,34 +1383,8 @@ def test_repository_analysis():
     repo_data = fetch_repository_contents_optimized.remote(test_repo)
     print(f"📊 Fetched {len(repo_data['file_data'])} files")
 
-    # Use SecurityAnalyzer class method directly
-    print("🚀 Starting security analysis with SecurityAnalyzer class method...")
-    analysis = SecurityAnalyzer()._perform_repository_analysis(repo_data)
-
-    print("\n🎉 Analysis Results:")
-    print(f"📁 Files scanned: {analysis.total_files_scanned}")
-    print(f"⚠️  Files with issues: {analysis.files_with_issues}")
-    print(f"🚨 Total issues found: {analysis.total_issues}")
-
-    # Show sample issues
-    issues_shown = 0
-    for file_analysis in analysis.file_analyses:
-        if file_analysis.issues and issues_shown < 5:  # Show max 5 issues
-            print(f"\n📄 {file_analysis.file_path}:")
-            for issue in file_analysis.issues[:2]:  # Max 2 issues per file
-                print(f"  - {issue.severity}: {issue.vulnerability_type}")
-                print(f"    {issue.description[:100]}...")
-                issues_shown += 1
-                if issues_shown >= 5:
-                    break
-
-    # Test performance
-    print("\n⏱️  Performance Stats:")
-    print(f"  Repository fetch time: {repo_data.get('fetch_time', 0):.2f}s")
-
     return {
         "test_status": "SUCCESS",
-        "files_scanned": analysis.total_files_scanned,
-        "issues_found": analysis.total_issues,
+        "files_found": len(repo_data["file_data"]),
         "fetch_time": repo_data.get("fetch_time", 0),
     }

@@ -1,8 +1,15 @@
 'use client';
 
 import { useState } from 'react';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Toaster, toast } from 'react-hot-toast';
 import Navigation from './components/Navigation';
+import { Button } from './components/ui/Button';
+import { ProgressTracker } from './components/analysis/ProgressTracker';
+import { SecuritySummary } from './components/analysis/SecuritySummary';
+import { useAnalysisStore } from './store/analysisStore';
+import { isValidGitHubUrl } from './utils';
+import modalApiClient from './services/modalApi';
 
 interface RepositoryInfo {
   name: string;
@@ -42,6 +49,7 @@ interface AnalysisSummary {
   critical_issues: number;
   high_issues: number;
   medium_issues: number;
+  recommendations: string[];
 }
 
 interface AnalysisResult {
@@ -54,60 +62,98 @@ interface AnalysisResult {
   };
 }
 
-const API_URL = `${process.env.NEXT_PUBLIC_API}/api/analyze`;
-
 export default function Home() {
   const [url, setUrl] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  
+  const {
+    isAnalyzing,
+    result,
+    error,
+    startAnalysis,
+    updateProgress,
+    setResult,
+    setError,
+    clearError,
+    resetAnalysis,
+    cancelAnalysis,
+  } = useAnalysisStore();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
-    setError(null);
+    
+    if (!isValidGitHubUrl(url)) {
+      toast.error('Please enter a valid GitHub repository URL');
+      return;
+    }
+
+    clearError();
+    startAnalysis(url);
 
     try {
-      const response = await fetch(API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ url }),
+      const analysisResult = await modalApiClient.analyzeRepository(url, {
+        onProgress: updateProgress,
       });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to analyze repository');
+      
+      setResult(analysisResult);
+      toast.success('Analysis completed successfully!');
+    } catch (err: any) {
+      console.error('Analysis failed:', err);
+      setError(err);
+      
+      // Show user-friendly error messages with actionable suggestions
+      if (err.type === 'NETWORK_ERROR') {
+        toast.error('Connection failed. Check your internet connection and try again.');
+      } else if (err.type === 'COLD_START_TIMEOUT') {
+        toast.error('The security analyzer is starting up. Please try again in a moment.');
+      } else if (err.type === 'ANALYSIS_TIMEOUT') {
+        toast.error('Analysis timed out. The repository may be too large (>50 files) or the service may be busy.');
+      } else if (err.type === 'INVALID_REPO') {
+        toast.error('Invalid repository URL or repository not accessible.');
+      } else if (err.type === 'RATE_LIMIT') {
+        toast.error('Rate limit exceeded. Please try again later.');
+      } else {
+        toast.error(err.message || 'Analysis failed. Please try again.');
       }
-
-      const data = await response.json();
-      setResult(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setLoading(false);
     }
   };
 
-  const getSeverityColor = (severity: string) => {
-    switch (severity.toLowerCase()) {
-      case 'critical':
-        return 'bg-red-500/20 border-red-500/50 text-red-400';
-      case 'high':
-        return 'bg-orange-500/20 border-orange-500/50 text-orange-400';
-      case 'medium':
-        return 'bg-yellow-500/20 border-yellow-500/50 text-yellow-400';
-      case 'low':
-        return 'bg-green-500/20 border-green-500/50 text-green-400';
-      default:
-        return 'bg-gray-500/20 border-gray-500/50 text-gray-400';
+  const handleTestConnection = async () => {
+    toast('Testing connection to Modal service...', { icon: '🔍' });
+    
+    try {
+      const health = await modalApiClient.healthCheck();
+      toast.success(`Connection successful! Service status: ${health.status}`);
+      console.log('Health check result:', health);
+    } catch (err: any) {
+      console.error('Health check failed:', err);
+      toast.error(`Connection test failed: ${err.message}`);
     }
+  };
+
+  const handleCancel = () => {
+    cancelAnalysis();
+    toast('Analysis cancelled', { icon: '⏹️' });
+  };
+
+  const handleReset = () => {
+    resetAnalysis();
+    setUrl('');
   };
 
   return (
     <>
       <Navigation />
+      <Toaster 
+        position="top-right"
+        toastOptions={{
+          style: {
+            background: 'rgba(17, 24, 39, 0.95)',
+            color: '#fff',
+            border: '1px solid rgba(255, 255, 255, 0.1)',
+          },
+        }}
+      />
+      
       <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-blue-900 text-white">
         {/* Animated background elements */}
         <div className="absolute inset-0 overflow-hidden pointer-events-none">
@@ -118,191 +164,285 @@ export default function Home() {
 
         <main className="relative min-h-screen pt-32 pb-8 px-8">
           <div className="max-w-7xl mx-auto">
+            
+            {/* Hero Section */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.5 }}
-              className="text-center mb-16"
+              className="text-center mb-12"
             >
               <h1 className="text-6xl font-bold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
-                GitHub Repository Security Analyzer
+                🔐 LLMGuard Security Analyzer
               </h1>
-              <p className="text-xl text-gray-300 max-w-3xl mx-auto">
-                Analyze your GitHub repository for security vulnerabilities, code quality, and best practices.
-                Get instant insights and actionable recommendations.
+              <p className="text-xl text-gray-300 max-w-4xl mx-auto leading-relaxed">
+                Advanced AI-powered security analysis using fine-tuned Qwen3 model. 
+                Identify vulnerabilities, get actionable recommendations, and secure your codebase with confidence.
               </p>
+              
+              <div className="mt-6 flex justify-center space-x-4 text-sm text-gray-400">
+                <span className="flex items-center">🤖 AI-Powered</span>
+                <span className="flex items-center">⚡ Real-time Analysis</span>
+                <span className="flex items-center">🎯 50+ File Types</span>
+                <span className="flex items-center">🔒 Security Focused</span>
+              </div>
             </motion.div>
 
+            {/* Analysis Form */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.5, delay: 0.2 }}
-              className="max-w-3xl mx-auto"
+              className="max-w-4xl mx-auto mb-8"
             >
-              <form onSubmit={handleSubmit} className="mb-8">
+              <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="flex gap-4">
                   <input
                     type="text"
                     value={url}
                     onChange={(e) => setUrl(e.target.value)}
-                    placeholder="Enter GitHub repository URL"
+                    placeholder="Enter GitHub repository URL (e.g., https://github.com/owner/repo)"
                     className="flex-1 p-4 rounded-lg bg-white/5 border border-white/10 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent backdrop-blur-sm"
                     required
+                    disabled={isAnalyzing}
                   />
-                  <motion.button
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
-                    type="submit"
-                    disabled={loading}
-                    className="px-8 py-4 rounded-lg bg-gradient-to-r from-blue-500 to-purple-600 text-white font-semibold hover:from-blue-600 hover:to-purple-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl transition-all"
-                  >
-                    {loading ? (
-                      <div className="flex items-center">
-                        <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                        </svg>
-                        Analyzing...
-                      </div>
-                    ) : 'Analyze'}
-                  </motion.button>
+                  
+                  <div className="flex gap-2">
+                    {!isAnalyzing ? (
+                      <>
+                        <Button
+                          type="submit"
+                          size="lg"
+                          disabled={!url.trim()}
+                          className="px-8"
+                        >
+                          🚀 Analyze Repository
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="lg"
+                          onClick={handleTestConnection}
+                          className="px-6"
+                        >
+                          🔍 Test Connection
+                        </Button>
+                      </>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="danger"
+                        size="lg"
+                        onClick={handleCancel}
+                        className="px-8"
+                      >
+                        ⏹️ Cancel
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                
+                {/* Quick Examples */}
+                <div className="text-center">
+                  <p className="text-sm text-gray-500 mb-2">Try these example repositories:</p>
+                  <div className="flex flex-wrap justify-center gap-2">
+                    {[
+                      'https://github.com/AdamSkog/Hadoop-DocuSearch',
+                      'https://github.com/octocat/Hello-World',
+                      'https://github.com/adamskog/sample-python-app'
+                    ].map((exampleUrl) => (
+                      <button
+                        key={exampleUrl}
+                        type="button"
+                        onClick={() => !isAnalyzing && setUrl(exampleUrl)}
+                        disabled={isAnalyzing}
+                        className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50 disabled:cursor-not-allowed px-2 py-1 rounded border border-blue-400/30 hover:border-blue-400/50 transition-colors"
+                      >
+                        {exampleUrl.split('/').slice(-2).join('/')}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </form>
             </motion.div>
 
-            {error && (
+            {/* Progress Tracker */}
+            <AnimatePresence>
+              {(isAnalyzing || result || error) && (
+                <div className="max-w-4xl mx-auto mb-8">
+                  <ProgressTracker onCancel={handleCancel} />
+                </div>
+              )}
+            </AnimatePresence>
+
+            {/* Error Display */}
+            <AnimatePresence>
+              {error && (
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                  className="max-w-4xl mx-auto mb-8"
+                >
+                  <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-6">
+                    <div className="flex items-start">
+                      <span className="text-red-400 mr-3 text-xl">❌</span>
+                      <div className="flex-1">
+                        <h3 className="text-red-400 font-semibold mb-2">Analysis Failed</h3>
+                        <p className="text-red-300/80 mb-3">{error.message}</p>
+                        
+                        {error.details && (
+                          <details className="text-sm text-red-300/60">
+                            <summary className="cursor-pointer hover:text-red-300/80">
+                              Technical Details
+                            </summary>
+                            <pre className="mt-2 p-2 bg-red-900/20 rounded text-xs overflow-auto">
+                              {error.details}
+                            </pre>
+                          </details>
+                        )}
+                        
+                        <div className="mt-4 flex space-x-3">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleSubmit(new Event('submit') as any)}
+                            disabled={isAnalyzing}
+                          >
+                            🔄 Retry Analysis
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleReset}
+                          >
+                            🔄 Start Over
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Results Display */}
+            <AnimatePresence>
+              {result && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.5 }}
+                  className="space-y-8"
+                >
+                  {/* Security Summary */}
+                  <SecuritySummary result={result} />
+
+                  {/* AI Recommendations */}
+                  {result.analysis_summary.recommendations.length > 0 && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: 0.3 }}
+                      className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl p-6"
+                    >
+                      <h3 className="text-xl font-semibold text-white mb-4 flex items-center">
+                        <span className="mr-2">💡</span>
+                        AI Security Recommendations
+                      </h3>
+                      <div className="space-y-3">
+                        {result.analysis_summary.recommendations.map((recommendation, index) => (
+                          <motion.div
+                            key={index}
+                            initial={{ opacity: 0, x: -20 }}
+                            animate={{ opacity: 1, x: 0 }}
+                            transition={{ delay: 0.4 + index * 0.1 }}
+                            className="flex items-start p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg"
+                          >
+                            <span className="text-blue-400 mr-3 font-bold">{index + 1}.</span>
+                            <p className="text-blue-100 leading-relaxed">{recommendation}</p>
+                          </motion.div>
+                        ))}
+                      </div>
+                    </motion.div>
+                  )}
+
+                  {/* Action Buttons */}
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.5 }}
+                    className="text-center space-x-4"
+                  >
+                    <Button
+                      variant="outline"
+                      onClick={handleReset}
+                    >
+                      🔄 Analyze Another Repository
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      onClick={() => {
+                        // TODO: Implement export functionality
+                        toast.success('Export feature coming soon!');
+                      }}
+                    >
+                      📄 Export Report
+                    </Button>
+                  </motion.div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Features Grid (shown when no analysis is running) */}
+            {!isAnalyzing && !result && !error && (
               <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="max-w-3xl mx-auto p-4 mb-8 bg-red-500/20 border border-red-500/50 text-red-200 rounded-lg backdrop-blur-sm"
+                transition={{ duration: 0.5, delay: 0.4 }}
+                className="mt-16"
               >
-                {error}
-              </motion.div>
-            )}
+                <h2 className="text-3xl font-bold text-center text-white mb-8">
+                  Advanced Security Analysis Features
+                </h2>
+                
+                <div className="grid md:grid-cols-3 gap-8">
+                  <motion.div
+                    whileHover={{ scale: 1.02 }}
+                    className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl p-6 text-center"
+                  >
+                    <div className="text-4xl mb-4">🤖</div>
+                    <h3 className="text-xl font-semibold text-white mb-3">AI-Powered Detection</h3>
+                    <p className="text-gray-400 leading-relaxed">
+                      Fine-tuned Qwen3 model trained specifically on security vulnerabilities 
+                      across multiple programming languages.
+                    </p>
+                  </motion.div>
 
-            {result && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.5 }}
-                className="space-y-8"
-              >
-                <section className="p-8 bg-white/5 rounded-xl backdrop-blur-sm border border-white/10">
-                  <h2 className="text-2xl font-semibold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
-                    Repository Information
-                  </h2>
-                  <div className="grid grid-cols-2 gap-8">
-                    <div className="space-y-4">
-                      <div>
-                        <span className="text-gray-400">Name</span>
-                        <p className="text-xl text-white">{result.repository_info.name}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-400">Description</span>
-                        <p className="text-xl text-white">{result.repository_info.description || 'N/A'}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-400">Language</span>
-                        <p className="text-xl text-white">{result.repository_info.language || 'N/A'}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-400">License</span>
-                        <p className="text-xl text-white">{result.repository_info.license || 'N/A'}</p>
-                      </div>
-                    </div>
-                    <div className="space-y-4">
-                      <div>
-                        <span className="text-gray-400">Stars</span>
-                        <p className="text-xl text-white">{result.repository_info.stars}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-400">Forks</span>
-                        <p className="text-xl text-white">{result.repository_info.forks}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-400">Watchers</span>
-                        <p className="text-xl text-white">{result.repository_info.watchers}</p>
-                      </div>
-                      <div>
-                        <span className="text-gray-400">Open Issues</span>
-                        <p className="text-xl text-white">{result.repository_info.open_issues}</p>
-                      </div>
-                    </div>
-                  </div>
-                </section>
+                  <motion.div
+                    whileHover={{ scale: 1.02 }}
+                    className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl p-6 text-center"
+                  >
+                    <div className="text-4xl mb-4">⚡</div>
+                    <h3 className="text-xl font-semibold text-white mb-3">Real-time Analysis</h3>
+                    <p className="text-gray-400 leading-relaxed">
+                      Fast, comprehensive scanning with progress tracking and detailed 
+                      insights for immediate action.
+                    </p>
+                  </motion.div>
 
-                <section className="p-8 bg-white/5 rounded-xl backdrop-blur-sm border border-white/10">
-                  <h2 className="text-2xl font-semibold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
-                    Security Summary
-                  </h2>
-                  <div className="grid grid-cols-4 gap-6">
-                    <div className="p-6 bg-red-500/20 rounded-lg border border-red-500/50">
-                      <div className="text-4xl font-bold text-red-400 mb-2">{result.analysis.summary.critical_issues}</div>
-                      <div className="text-sm text-red-300">Critical Issues</div>
-                    </div>
-                    <div className="p-6 bg-orange-500/20 rounded-lg border border-orange-500/50">
-                      <div className="text-4xl font-bold text-orange-400 mb-2">{result.analysis.summary.high_issues}</div>
-                      <div className="text-sm text-orange-300">High Issues</div>
-                    </div>
-                    <div className="p-6 bg-yellow-500/20 rounded-lg border border-yellow-500/50">
-                      <div className="text-4xl font-bold text-yellow-400 mb-2">{result.analysis.summary.medium_issues}</div>
-                      <div className="text-sm text-yellow-300">Medium Issues</div>
-                    </div>
-                    <div className="p-6 bg-blue-500/20 rounded-lg border border-blue-500/50">
-                      <div className="text-4xl font-bold text-blue-400 mb-2">{result.analysis.summary.total_issues}</div>
-                      <div className="text-sm text-blue-300">Total Issues</div>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="p-8 bg-white/5 rounded-xl backdrop-blur-sm border border-white/10">
-                  <h2 className="text-2xl font-semibold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
-                    Security Issues
-                  </h2>
-                  <div className="space-y-4">
-                    {result.analysis.security_issues.map((issue, index) => (
-                      <motion.div
-                        initial={{ opacity: 0, x: -20 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        transition={{ delay: index * 0.1 }}
-                        key={index}
-                        className="p-6 bg-white/5 rounded-lg border border-white/10 backdrop-blur-sm"
-                      >
-                        <div className="flex justify-between items-start mb-4">
-                          <h3 className="text-xl font-semibold text-white">{issue.type}</h3>
-                          <span className={`px-3 py-1 rounded-full ${getSeverityColor(issue.severity)}`}>
-                            {issue.severity}
-                          </span>
-                        </div>
-                        <p className="text-gray-300 mb-4">{issue.description}</p>
-                        <div className="flex justify-between items-center">
-                          <p className="text-sm text-gray-400">Location: {issue.location}</p>
-                          <p className="text-sm text-blue-400">Recommendation: {issue.recommendation}</p>
-                        </div>
-                      </motion.div>
-                    ))}
-                  </div>
-                </section>
-
-                <section className="p-8 bg-white/5 rounded-xl backdrop-blur-sm border border-white/10">
-                  <h2 className="text-2xl font-semibold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
-                    Code Metrics
-                  </h2>
-                  <div className="grid grid-cols-3 gap-6">
-                    <div className="p-6 bg-blue-500/20 rounded-lg border border-blue-500/50">
-                      <div className="text-3xl font-bold text-blue-400 mb-2">{result.analysis.code_metrics.total_lines}</div>
-                      <div className="text-sm text-blue-300">Total Lines</div>
-                    </div>
-                    <div className="p-6 bg-purple-500/20 rounded-lg border border-purple-500/50">
-                      <div className="text-3xl font-bold text-purple-400 mb-2">{result.analysis.code_metrics.complexity}</div>
-                      <div className="text-sm text-purple-300">Complexity Score</div>
-                    </div>
-                    <div className="p-6 bg-green-500/20 rounded-lg border border-green-500/50">
-                      <div className="text-3xl font-bold text-green-400 mb-2">{result.analysis.code_metrics.test_coverage}%</div>
-                      <div className="text-sm text-green-300">Test Coverage</div>
-                    </div>
-                  </div>
-                </section>
+                  <motion.div
+                    whileHover={{ scale: 1.02 }}
+                    className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl p-6 text-center"
+                  >
+                    <div className="text-4xl mb-4">🎯</div>
+                    <h3 className="text-xl font-semibold text-white mb-3">Multi-Language Support</h3>
+                    <p className="text-gray-400 leading-relaxed">
+                      Supports Python, JavaScript, Java, C++, PHP, Ruby, Swift, Go, 
+                      Kotlin, and more programming languages.
+                    </p>
+                  </motion.div>
+                </div>
               </motion.div>
             )}
           </div>
