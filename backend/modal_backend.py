@@ -48,16 +48,12 @@ image = (
     )
 )
 
-# Model configuration - UPDATED FOR UNSLOTH + LORA
+# Model configuration - Unsloth + LORA
 BASE_MODEL_NAME = "unsloth/Qwen3-4B-unsloth-bnb-4bit"
 LORA_ADAPTERS_NAME = "AdamDS/qwen3-security-dpo-4b"
 
 # Your merged model configuration
 MERGED_MODEL_NAME = "AdamDS/qwen3-security-merged-4b"
-
-# Create global SecurityAnalyzer instance at module level
-# security_analyzer = SecurityAnalyzer()  -> MOVE THIS AFTER CLASS DEFINITION
-
 
 @dataclass
 class SecurityIssue:

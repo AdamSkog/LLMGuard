@@ -12,7 +12,7 @@
   <p align="center">
     AI-Powered Code Security Analysis Platform using Fine-tuned Large Language Models
     <br />
-    <a href="https://github.com/AdamSkog/LLMGuard/blob/main/LLMGuard.md"><strong>Explore the Research Paper » (TBD)</strong></a>
+    <a href=""><strong>Explore the Research Paper » (TBD)</strong></a>
     <br />
     <br />
     <a href="https://llmguard-frontend.vercel.app">View Demo</a>
@@ -242,7 +242,7 @@ modal serve modal_backend.py
 - Concurrent repository processing
 - CORS-enabled API endpoints
 
-### Frontend (Vercel)
+### Frontend (Vercel) (TO BE DEPLOYED AS OF NOW)
 
 The frontend is deployed on Vercel for global edge distribution:
 
@@ -330,7 +330,7 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 **Project Link**: [https://github.com/AdamSkog/LLMGuard](https://github.com/AdamSkog/LLMGuard)
 
-**Research Paper**: [LLMGuard.md](https://github.com/AdamSkog/LLMGuard/blob/main/LLMGuard.md)
+**Research Paper**: TBD
 
 ---
 
