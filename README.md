@@ -328,6 +328,9 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 **Adam Skoglund** - [@AdamSkog](https://linkedin.com/in/adam-skoglund) - adamskoglund2022@gmail.com
 
+**Swastik Singh** - [@SwasSingh](https://linkedin.com/in/SwasSingh) - 
+Swastik.Singh@gmail.com
+
 **Project Link**: [https://github.com/AdamSkog/LLMGuard](https://github.com/AdamSkog/LLMGuard)
 
 **Research Paper**: TBD
@@ -336,7 +339,7 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 <div align="center">
   <p>⭐ Star this repo if you find it helpful!</p>
-  <p>Built with ❤️ by Adam Skoglund</p>
+  <p>Built with ❤️ by Adam Skoglund & Swastik Singh</p>
 </div>
 
 <!-- MARKDOWN LINKS & IMAGES -->
